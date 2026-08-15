@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+env/
+.env
+.streamlit/secrets.toml
+access_token.txt
+*.csv
+*.xlsx
+*.log
