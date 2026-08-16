@@ -1,22 +1,24 @@
-import os
-import streamlit as st
-import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
+import time
+import threading
+import urllib.parse
+import html
+import webbrowser
 from kiteconnect import KiteConnect
-# ==========================================
-# 1. ZERODHA API CREDENTIALS & CONSTANTS
-# ==========================================
-# Cloud-safe authentication:
-# - API key/secret are read from Streamlit secrets or environment variables.
-# - No credentials or access token are stored in source code.
-# - The Zerodha request_token is received through the registered HTTPS
-#   redirect URL using Streamlit query parameters.
-# - The access token is kept only in the current Streamlit session.
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-def _get_secret(name: str, default: str = "") -> str:
+# ==========================================
+# MODULE 1: ZERODHA API CREDENTIALS & CONSTANTS
+# ==========================================
+def _read_secret(name: str, default: str = "") -> str:
+    """Read a Streamlit secret first, then an environment variable."""
     try:
-        value = st.secrets.get(name, default)
+        value = st.secrets.get(name, "")
         if value:
             return str(value).strip()
     except Exception:
@@ -24,12 +26,20 @@ def _get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-API_KEY = _get_secret("ZERODHA_API_KEY")
-API_SECRET = _get_secret("ZERODHA_API_SECRET")
-REDIRECT_URI = _get_secret("ZERODHA_REDIRECT_URI")
+API_KEY = _read_secret("ZERODHA_API_KEY", "magym2s4yk13gsze")
+API_SECRET = _read_secret("ZERODHA_API_SECRET", "83cuxyx91lv9ae371ogcs6ckvu5kto8q")
+REDIRECT_URI = _read_secret(
+    "ZERODHA_REDIRECT_URI",
+    "https://geminie-trading-3xszcb58jqdnsp3dyhulqk.streamlit.app",
+)
 
-# Scanner thresholds. Keep these centralized so the strategy can be tuned
-# without changing the core decision engine.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+TOKEN_FILE = os.path.join(BASE_DIR, os.getenv("ZERODHA_TOKEN_FILE", "access_token.txt"))
+
+PORT = 5000
+LOCAL_REDIRECT = f"http://127.0.0.1:{PORT}/"
+
+# Screener Thresholds & Parameter Filters
 SCREENER = {
     "min_score": 60,
     "strict_score": 75,
@@ -41,7 +51,7 @@ SCREENER = {
     "narrow_cpr_pct": 0.35,
 }
 
-# Major Index Mappings
+# Major Index Mapping & Tokens
 INDEX_MAP = {
     "NIFTY": {"symbol": "NIFTY 50", "token": 256265, "name": "NIFTY"},
     "BANKNIFTY": {
@@ -113,99 +123,415 @@ NIFTY_CONSTITUENTS = {
 }
 
 # ==========================================
-# 2. CLOUD ZERODHA AUTHENTICATION
+# MODULE 2: ZERODHA AUTHENTICATION & HANDLERS
 # ==========================================
-def _validate_kite_session(kite):
+class TokenCallbackHandler(BaseHTTPRequestHandler):
+    request_token = None
+    callback_error = None
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        TokenCallbackHandler.request_token = params.get("request_token", [None])[0]
+        TokenCallbackHandler.callback_error = (
+            params.get("message", [None])[0] or params.get("error", [None])[0]
+        )
+        body = (
+            "Zerodha authentication successful. You may close this window."
+            if TokenCallbackHandler.request_token
+            else "Zerodha authentication failed or no request token was received."
+        )
+        body_bytes = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def log_message(self, format, *args):
+        return
+
+
+def _is_local_redirect() -> bool:
+    return "127.0.0.1" in REDIRECT_URI or "localhost" in REDIRECT_URI
+
+
+def _save_local_access_token(access_token: str):
+    if not _is_local_redirect():
+        return
     try:
-        profile = kite.profile()
-        return bool(profile)
+        Path(TOKEN_FILE).write_text(access_token.strip(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _read_local_access_token() -> str:
+    if not _is_local_redirect():
+        return ""
+    try:
+        if os.path.isfile(TOKEN_FILE):
+            return Path(TOKEN_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _validate_kite_session(kite) -> bool:
+    try:
+        return bool(kite.profile())
     except Exception:
         return False
 
 
-def _build_login_url() -> str:
-    kite = KiteConnect(api_key=API_KEY)
-    return kite.login_url()
+def _generate_kite_session(kite, request_token: str) -> bool:
+    try:
+        data = kite.generate_session(request_token, api_secret=API_SECRET)
+        access_token = data.get("access_token")
+        if not access_token:
+            st.error("Zerodha did not return an access token.")
+            return False
+
+        kite.set_access_token(access_token)
+        if not _validate_kite_session(kite):
+            st.error("Access token generated but Kite session could not be validated.")
+            return False
+
+        st.session_state["zerodha_kite"] = kite
+        st.session_state["zerodha_access_token"] = access_token
+        st.session_state["zerodha_login_done"] = True
+        _save_local_access_token(access_token)
+        return True
+    except Exception as exc:
+        st.error(f"Zerodha session generation failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def run_local_auth_flow(api_key: str, port: int = PORT) -> str | None:
+    TokenCallbackHandler.request_token = None
+    TokenCallbackHandler.callback_error = None
+    try:
+        server = HTTPServer(("127.0.0.1", port), TokenCallbackHandler)
+        server.timeout = 1
+    except OSError:
+        st.error(f"Cannot start local Zerodha callback on 127.0.0.1:{port}.")
+        return None
+
+    login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={urllib.parse.quote(api_key)}"
+    try:
+        webbrowser.open(login_url)
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            server.handle_request()
+            if TokenCallbackHandler.request_token or TokenCallbackHandler.callback_error:
+                break
+    finally:
+        server.server_close()
+
+    if TokenCallbackHandler.callback_error:
+        st.error(f"Zerodha authentication error: {TokenCallbackHandler.callback_error}")
+        return None
+    return TokenCallbackHandler.request_token
 
 
 def get_authenticated_kite():
-    """Authenticate Zerodha without a localhost callback.
-
-    The user is sent to Zerodha's login page. Zerodha redirects back to the
-    registered HTTPS REDIRECT_URI with a short-lived request_token. Streamlit
-    reads that token from st.query_params and exchanges it server-side for an
-    access_token. The API secret never reaches the browser.
-    """
-    if not API_KEY or not API_SECRET:
-        st.error(
-            "Zerodha credentials are missing. Add ZERODHA_API_KEY and "
-            "ZERODHA_API_SECRET to Streamlit Secrets."
-        )
-        return None
-
+    missing = []
+    if not API_KEY:
+        missing.append("ZERODHA_API_KEY")
+    if not API_SECRET:
+        missing.append("ZERODHA_API_SECRET")
     if not REDIRECT_URI:
-        st.error(
-            "ZERODHA_REDIRECT_URI is missing. After deployment, set it to the "
-            "exact HTTPS URL registered in your Kite Connect app."
-        )
+        missing.append("ZERODHA_REDIRECT_URI")
+    if missing:
+        st.error("Zerodha credentials missing: " + ", ".join(missing))
         return None
 
-    cached_kite = st.session_state.get("zerodha_kite")
-    if cached_kite is not None and _validate_kite_session(cached_kite):
-        return cached_kite
+    cached = st.session_state.get("zerodha_kite")
+    if cached is not None and _validate_kite_session(cached):
+        return cached
 
     kite = KiteConnect(api_key=API_KEY)
 
-    request_token = st.query_params.get("request_token")
-    status = st.query_params.get("status")
+    try:
+        request_token = st.query_params.get("request_token")
+        status = st.query_params.get("status", "")
+    except Exception:
+        request_token, status = None, ""
 
-    if request_token and (not status or status.lower() in ("success", "ok")):
-        try:
-            session_data = kite.generate_session(
-                request_token, api_secret=API_SECRET
-            )
-            access_token = session_data.get("access_token")
-            if not access_token:
-                st.error("Zerodha did not return an access token.")
-                return None
-
-            kite.set_access_token(access_token)
-            if not _validate_kite_session(kite):
-                st.error("Zerodha access token validation failed.")
-                return None
-
-            st.session_state["zerodha_kite"] = kite
-            st.session_state["zerodha_login_done"] = True
-
-            # Remove the one-time request_token from the browser URL.
-            st.query_params.clear()
-            st.success("🎉 Zerodha login successful. Live market data is ready.")
+    if request_token and str(status).lower() in ("", "success", "ok"):
+        if _generate_kite_session(kite, str(request_token)):
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.success("🎉 Zerodha login successful.")
             return kite
 
-        except Exception as exc:
-            st.error(
-                "❌ Zerodha session generation failed."
-                f"\n\n{type(exc).__name__}: {exc}"
-            )
-            return None
+    local_token = _read_local_access_token()
+    if local_token:
+        try:
+            kite.set_access_token(local_token)
+            if _validate_kite_session(kite):
+                st.session_state["zerodha_kite"] = kite
+                st.session_state["zerodha_access_token"] = local_token
+                return kite
+        except Exception:
+            pass
 
-    if status and status.lower() not in ("success", "ok"):
-        message = st.query_params.get("message") or st.query_params.get("error")
-        st.error(f"Zerodha authentication failed: {message or status}")
-        st.query_params.clear()
+    if _is_local_redirect():
+        st.info("🔐 Desktop mode: use local Zerodha login callback.")
+        if st.button("🔑 Login to Zerodha", type="primary", key="zerodha_login_button"):
+            request_token = run_local_auth_flow(API_KEY, PORT)
+            if request_token and _generate_kite_session(kite, request_token):
+                st.rerun()
+        return None
 
-    st.markdown("### 🔐 Zerodha Login")
-    st.info(
-        "Click the button below, complete Zerodha login in your browser, and "
-        "Zerodha will redirect you back to Geminie Trading."
+    login_url = (
+        "https://kite.zerodha.com/connect/login?v=3&api_key="
+        + urllib.parse.quote(API_KEY, safe="")
     )
-    st.link_button("🔑 Login to Zerodha", _build_login_url(), type="primary")
-    st.caption(f"Registered redirect URL: {REDIRECT_URI}")
+    st.warning("🔐 Zerodha session required. Click below to authenticate.")
+    safe_url = html.escape(login_url, quote=True)
+    st.markdown(
+        f'''<a href="{safe_url}" target="_self" rel="noopener"
+        style="display:inline-block;padding:0.65rem 1rem;border-radius:0.5rem;
+        background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">
+        🔑 Login to Zerodha
+        </a>''',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Kite Redirect URL must match: {REDIRECT_URI}")
     return None
 
 
 # ==========================================
-# 4. OPTION CHAIN DIRECTION ENGINE
+# MODULE 3: HISTORICAL DATA FETCH & RETRY API
+# ==========================================
+def safe_fetch_history(kite, token, from_date, to_date, interval, oi=False, attempts=3):
+    """Safe retry wrapper for historical data API calls with rate-limit backoff."""
+    for attempt in range(attempts):
+        try:
+            kwargs = {
+                "instrument_token": token,
+                "from_date": from_date,
+                "to_date": to_date,
+                "interval": interval,
+            }
+            if oi:
+                kwargs["oi"] = True
+            return kite.historical_data(**kwargs)
+        except Exception as exc:
+            if attempt == attempts - 1:
+                return []
+            if "Too many requests" in str(exc) or "429" in str(exc):
+                time.sleep(1.0 + attempt)
+            else:
+                time.sleep(0.25)
+    return []
+
+
+# ==========================================
+# MODULE 4: TECHNICAL INDICATORS & MATH ENGINE
+# ==========================================
+def calculate_rsi(series, period=9):
+    values = pd.to_numeric(series, errors="coerce")
+    delta = values.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+
+    no_loss = avg_loss.eq(0) & avg_gain.gt(0)
+    no_gain = avg_gain.eq(0) & avg_loss.gt(0)
+    flat = avg_gain.eq(0) & avg_loss.eq(0)
+    rsi = rsi.mask(no_loss, 100.0)
+    rsi = rsi.mask(no_gain, 0.0)
+    rsi = rsi.mask(flat, 50.0)
+    return rsi.fillna(50.0)
+
+
+def calculate_wma(series, length=21):
+    weights = np.arange(1, length + 1)
+    return series.rolling(length).apply(
+        lambda candles: np.dot(candles, weights) / weights.sum(), raw=True
+    )
+
+
+def calculate_hilega_milega(df):
+    if df is None or df.empty or len(df) < 21:
+        return df
+
+    rsi = calculate_rsi(df["close"], period=9)
+    price_ema = rsi.ewm(span=3, adjust=False).mean()
+    strength_wma = calculate_wma(rsi, length=21)
+
+    df["hm_rsi"] = rsi
+    df["hm_ema_price"] = price_ema
+    df["hm_wma_strength"] = strength_wma
+    return df
+
+
+def calculate_cpr_values(high, low, close):
+    pivot = (high + low + close) / 3.0
+    bc = (high + low) / 2.0
+    tc = (pivot - bc) + pivot
+
+    tc_final = max(tc, bc)
+    bc_final = min(tc, bc)
+    cpr_width_pct = abs(tc_final - bc_final) / pivot * 100.0 if pivot > 0 else 0.0
+
+    return pivot, tc_final, bc_final, cpr_width_pct
+
+
+def calculate_cpr(prev_day_candle):
+    high = prev_day_candle["high"]
+    low = prev_day_candle["low"]
+    close = prev_day_candle["close"]
+
+    pivot = (high + low + close) / 3.0
+    bc = (high + low) / 2.0
+    tc = (pivot - bc) + pivot
+
+    cpr_top = max(tc, bc)
+    cpr_bottom = min(tc, bc)
+    cpr_width_pct = round(((cpr_top - cpr_bottom) / pivot) * 100, 2) if pivot > 0 else 0.0
+    is_narrow_cpr = cpr_width_pct <= SCREENER["narrow_cpr_pct"]
+
+    return round(pivot, 2), round(cpr_top, 2), round(cpr_bottom, 2), is_narrow_cpr
+
+
+def calculate_atr(df, period=14):
+    if df is None or len(df) < period + 1:
+        return 0.0
+
+    df_atr = df.copy()
+    df_atr["prev_close"] = df_atr["close"].shift(1)
+    df_atr["tr1"] = df_atr["high"] - df_atr["low"]
+    df_atr["tr2"] = (df_atr["high"] - df_atr["prev_close"]).abs()
+    df_atr["tr3"] = (df_atr["low"] - df_atr["prev_close"]).abs()
+    df_atr["tr"] = df_atr[["tr1", "tr2", "tr3"]].max(axis=1)
+
+    atr_series = df_atr["tr"].rolling(window=period).mean()
+    return round(atr_series.iloc[-1], 2)
+
+
+def check_sma_20_bounce(df_hourly):
+    if df_hourly is None or len(df_hourly) < 21:
+        return "⚪ Insufficient Data"
+
+    df_hourly = df_hourly.copy()
+    df_hourly["sma_20"] = df_hourly["close"].rolling(window=20).mean()
+
+    latest_candle = df_hourly.iloc[-1]
+    prev_candle = df_hourly.iloc[-2]
+
+    current_price = latest_candle["close"]
+    sma_20_val = latest_candle["sma_20"]
+
+    if np.isnan(sma_20_val) or sma_20_val == 0:
+        return "⚪ Normal"
+
+    dist_pct = abs(current_price - sma_20_val) / sma_20_val * 100
+
+    tested_sma = (prev_candle["low"] <= sma_20_val * 1.005) or (
+        latest_candle["low"] <= sma_20_val * 1.005
+    )
+    is_bouncing_up = (
+        current_price >= sma_20_val and current_price > latest_candle["open"]
+    )
+    is_breaking_down = current_price < sma_20_val
+
+    if tested_sma and is_bouncing_up and dist_pct <= 0.75:
+        return f"🟢 Bullish Bounce (SMA: ₹{round(sma_20_val, 1)})"
+    elif is_breaking_down and dist_pct <= 0.75:
+        return f"🔴 Breakdown Test (SMA: ₹{round(sma_20_val, 1)})"
+    elif dist_pct <= 0.5:
+        return f"⚡ At 20 SMA (₹{round(sma_20_val, 1)})"
+
+    return "⚪ Normal"
+
+
+def check_bollinger_blast(df):
+    if df is None or len(df) < 20:
+        return False
+    sma = df["close"].rolling(20).mean()
+    std = df["close"].rolling(20).std()
+    upper_band = sma + (2 * std)
+
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    is_above_ub = latest["close"] > upper_band.iloc[-1]
+    is_rising = latest["close"] > prev["close"]
+    return is_above_ub and is_rising
+
+
+def calculate_option_vwap(df_5min):
+    if df_5min is None or df_5min.empty or "volume" not in df_5min.columns:
+        return 0.0
+
+    typical_price = (df_5min["high"] + df_5min["low"] + df_5min["close"]) / 3.0
+    cum_pv = (typical_price * df_5min["volume"]).sum()
+    cum_vol = df_5min["volume"].sum()
+
+    if cum_vol > 0:
+        return round(cum_pv / cum_vol, 2)
+    return 0.0
+
+
+def get_hm_status(df):
+    if df is None or df.empty or len(df) < 22 or "hm_ema_price" not in df.columns:
+        return "⚪ Neutral"
+
+    latest = df.iloc[-1]
+    hm_ema = latest["hm_ema_price"]
+    hm_wma = latest["hm_wma_strength"]
+
+    if hm_ema > hm_wma and hm_ema >= 50:
+        return "🟢 Bullish"
+    elif hm_ema < hm_wma and hm_ema <= 50:
+        return "🔴 Bearish"
+    else:
+        return "⚪ Neutral"
+
+
+def check_rsi_strength_9(df):
+    if df is None or df.empty or len(df) < 22:
+        return False, 0.0
+
+    rsi9 = calculate_rsi(df["close"], period=9)
+    rsi_ema3 = rsi9.ewm(span=3, adjust=False).mean()
+    rsi_wma21 = calculate_wma(rsi9, length=21)
+
+    curr_rsi9 = rsi9.iloc[-1]
+    curr_ema3 = rsi_ema3.iloc[-1]
+    curr_wma21 = rsi_wma21.iloc[-1]
+
+    is_buy = (curr_rsi9 > curr_wma21) and (curr_rsi9 > curr_ema3)
+    return is_buy, curr_rsi9
+
+
+def fetch_india_vix_regime(kite):
+    try:
+        quote = kite.quote(["NSE:INDIA VIX"])
+        vix_data = quote.get("NSE:INDIA VIX", {})
+        vix_price = vix_data.get("last_price", 0.0)
+
+        if vix_price > 18.0:
+            regime = f"⚠️ High Volatility (VIX: {vix_price})"
+        elif vix_price < 12.0:
+            regime = f"🟢 Low Volatility (VIX: {vix_price})"
+        else:
+            regime = f"⚪ Normal Volatility (VIX: {vix_price})"
+
+        return vix_price, regime
+    except Exception:
+        return 0.0, "⚪ VIX Unavailable"
+
+# ==========================================
+# MODULE 5: OPTION CHAIN DIRECTION & PCR ENGINE
 # ==========================================
 def analyze_option_chain_direction(kite, nfo_instruments, symbol: str):
     try:
@@ -228,7 +554,11 @@ def analyze_option_chain_direction(kite, nfo_instruments, symbol: str):
         spot_quote = kite.quote([spot_symbol])
         spot_price = spot_quote.get(spot_symbol, {}).get("last_price", 0.0)
 
-        options["expiry"] = pd.to_datetime(options["expiry"])
+        options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce")
+        today_date = pd.Timestamp(datetime.now().date())
+        options = options[options["expiry"] >= today_date]
+        if options.empty:
+            return 1.0, "⚪ Neutral (No Future Expiry)"
         nearest_expiry = options["expiry"].min()
         near_options = options[options["expiry"] == nearest_expiry].copy()
 
@@ -290,10 +620,11 @@ def analyze_option_chain_direction(kite, nfo_instruments, symbol: str):
 
 
 # ==========================================
-# EXECUTIVE SUMMARY ENGINE
+# MODULE 6: EXECUTIVE SUMMARY & CASH FLOW ENGINE
 # ==========================================
 def render_executive_summary():
     st.markdown("## 📌 Executive Summary: Market Overview & Global Conditions")
+    st.caption("ℹ️ Global macro figures in this panel are reference placeholders, not a live external macro feed.")
 
     st.markdown(
         """
@@ -334,13 +665,9 @@ def render_executive_summary():
 
     st.markdown("---")
 
-    # ==========================================
-    # INSTITUTIONAL CASH FLOW ENGINE (MONTHLY, LAST WEEK, CURRENT WEEK)
-    # ==========================================
     st.markdown("### 🏦 Institutional Cash Flow Summary (FII vs DII Net Activity)")
     st.caption("Tracking institutional capital movement across Monthly, Last Week, and Date-wise Current Week segments (in ₹ Crores).")
 
-    # 1. Monthly Summary Data
     monthly_data = [
         {"Period": "Current Month (MTD)", "FII Net (₹ Cr)": -8450.60, "DII Net (₹ Cr)": +12340.20, "Net Market Flow (₹ Cr)": +3889.60, "Institutional Sentiment": "🟢 DII Absorption"},
         {"Period": "Previous Month", "FII Net (₹ Cr)": -15230.10, "DII Net (₹ Cr)": +22100.80, "Net Market Flow (₹ Cr)": +6870.70, "Institutional Sentiment": "🟢 DII Absorption"},
@@ -348,7 +675,6 @@ def render_executive_summary():
     ]
     df_monthly = pd.DataFrame(monthly_data)
 
-    # 2. Last Week Summary Data
     last_week_data = [
         {"Day": "Last Monday", "FII Net (₹ Cr)": -1850.20, "DII Net (₹ Cr)": +2100.40, "Net Market Flow (₹ Cr)": +250.20, "Institutional Sentiment": "🟢 Mild Net Positive"},
         {"Day": "Last Tuesday", "FII Net (₹ Cr)": -920.10, "DII Net (₹ Cr)": +1450.80, "Net Market Flow (₹ Cr)": +530.70, "Institutional Sentiment": "🟢 Steady Inflow"},
@@ -358,9 +684,8 @@ def render_executive_summary():
     ]
     df_last_week = pd.DataFrame(last_week_data)
 
-    # 3. Date-wise Current Week Data
     today = datetime.now()
-    start_of_week = today - timedelta(days=today.weekday())  # Monday of current week
+    start_of_week = today - timedelta(days=today.weekday())
     
     current_week_data = [
         {"Date": (start_of_week + timedelta(days=0)).strftime("%Y-%m-%d"), "Day": "Monday", "FII Net (₹ Cr)": -1250.40, "DII Net (₹ Cr)": +1850.20, "Net Market Flow (₹ Cr)": +599.80, "Institutional Sentiment": "🟢 DII Absorption"},
@@ -371,7 +696,6 @@ def render_executive_summary():
     ]
     df_current_week = pd.DataFrame(current_week_data)
 
-    # Sub-tabs for clean user navigation
     tab_curr_wk, tab_last_wk, tab_monthly = st.tabs([
         "📅 Date-wise Current Week Flow", 
         "⏳ Last Week Flow Summary", 
@@ -418,7 +742,7 @@ def render_executive_summary():
 
 
 # ==========================================
-# STRATEGY BUILDER POPUP DIALOG
+# MODULE 7: STRATEGY BUILDER DIALOG & FRAMEWORK
 # ==========================================
 @st.dialog("🛠️ Strategy Builder & Leg Execution", width="large")
 def open_strategy_builder_dialog(strategy_name, scenario_title, execution_steps):
@@ -431,7 +755,6 @@ def open_strategy_builder_dialog(strategy_name, scenario_title, execution_steps)
     legs = []
     if ":" in strategy_name:
         parts = strategy_name.split(":", 1)
-        strat_type = parts[0].strip()
         leg_info = parts[1].strip()
         leg_items = leg_info.split("/")
         for leg in leg_items:
@@ -460,24 +783,17 @@ def open_strategy_builder_dialog(strategy_name, scenario_title, execution_steps)
     st.divider()
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("🚀 Transmit Order Basket", use_container_width=True, type="primary"):
-            st.success("Orders transmitted successfully to execution terminal!")
+        if st.button("📋 Prepare Order Basket", use_container_width=True, type="primary"):
+            st.info("Order execution disabled in view mode. Review legs in Zerodha Kite.")
     with col_b:
         if st.button("❌ Close Builder", use_container_width=True):
             st.rerun()
 
 
-# ==========================================
-# INSTITUTIONAL STRATEGY ENGINE
-# ==========================================
-def render_strategy_and_positioning(
-    net_pts_impact, weighted_adv_sum, weighted_dec_sum, last_close
-):
+def render_strategy_and_positioning(net_pts_impact, weighted_adv_sum, weighted_dec_sum, last_close):
     st.markdown("### 💡 Institutional Strategy & Options Execution Framework")
 
-    ad_ratio = (
-        weighted_adv_sum / weighted_dec_sum if weighted_dec_sum > 0 else 5.0
-    )
+    ad_ratio = weighted_adv_sum / weighted_dec_sum if weighted_dec_sum > 0 else 5.0
     atm_strike = round(last_close, -2)
 
     vwap_15m = round(last_close + 20, -1)
@@ -488,7 +804,6 @@ def render_strategy_and_positioning(
 
     if net_pts_impact > 80 and ad_ratio >= 1.5:
         scenario_title = "🔥 High-Momentum Bullish Expansion"
-
         intraday_vehicle = f"Bull Call Spread: Buy ATM ({atm_strike:.0f} CE) / Sell {atm_strike + 200:.0f} CE"
         intraday_execution = [
             "**Delta/Theta Alignment:** Positive Delta (+0.35 net) with capped daily Theta decay.",
@@ -507,7 +822,6 @@ def render_strategy_and_positioning(
 
     elif net_pts_impact > 20 and ad_ratio >= 1.0:
         scenario_title = "🟢 Cautious Bullish / Accumulation Phase"
-
         intraday_vehicle = f"Bull Put Credit Spread (0-1 DTE): Sell {atm_strike - 100:.0f} PE / Buy {atm_strike - 250:.0f} PE"
         intraday_execution = [
             "**Delta/Theta Alignment:** Positive Theta collecting decay while market holds support.",
@@ -526,7 +840,6 @@ def render_strategy_and_positioning(
 
     elif -20 <= net_pts_impact <= 20:
         scenario_title = "🟡 Rangebound / Low Volatility Drift"
-
         intraday_vehicle = f"Iron Condor (0-1 DTE): Sell {atm_strike + 250:.0f} CE & {atm_strike - 250:.0f} PE | Buy Hedges 150 pts wider"
         intraday_execution = [
             "**Delta/Theta Alignment:** Delta Neutral, High Positive Theta.",
@@ -545,7 +858,6 @@ def render_strategy_and_positioning(
 
     elif net_pts_impact < -80 and ad_ratio <= 0.6:
         scenario_title = "🔴 Heavy Bearish Distribution Phase"
-
         intraday_vehicle = f"Bear Put Spread: Buy ATM ({atm_strike:.0f} PE) / Sell {atm_strike - 200:.0f} PE"
         intraday_execution = [
             "**Delta/Theta Alignment:** Negative Delta (-0.40 net) aligned with institutional unwinding.",
@@ -564,7 +876,6 @@ def render_strategy_and_positioning(
 
     else:
         scenario_title = "🔴 Mild Bearish / Retracement"
-
         intraday_vehicle = f"Bear Call Credit Spread (0-1 DTE): Sell {atm_strike + 100:.0f} CE / Buy {atm_strike + 250:.0f} CE"
         intraday_execution = [
             "**Delta/Theta Alignment:** Negative Delta with positive time decay.",
@@ -607,7 +918,7 @@ def render_strategy_and_positioning(
 
 
 # ==========================================
-# 5. MARKET HEADER, BREADTH & EXPECTED NIFTY PROJECTION ENGINE
+# MODULE 8: MARKET HEADER, BREADTH & SECTOR PROJECTION
 # ==========================================
 def get_metric_data(quotes, quote_key):
     q = quotes.get(quote_key, {})
@@ -753,14 +1064,14 @@ def render_market_header_and_breadth(kite):
         if spread < 0:
             val_title = "🔴 Market Trading at DISCOUNT"
             val_details = f"Futures trading <b>₹{abs(spread):.2f} BELOW Spot</b>. Indicates Short Build-up or Dividend Adjustments."
-            action_advice = "🎯 <b>ACTIONABLE FOCUS: LOOK AT PUT SIDE OPTIONS</b> (Focus on Bear Call Spreads, Bear Put Spreads, or Put Buys on breakdowns)."
+            action_advice = "🎯 <b>ACTIONABLE FOCUS: LOOK AT PUT SIDE OPTIONS</b> (Bear Call Spreads, Bear Put Spreads, or Put Buys)."
             val_bg = "#f8d7da"
             val_border = "#842029"
             val_text_color = "#842029"
         else:
             val_title = "🟢 Market Trading at PREMIUM"
             val_details = f"Futures trading <b>₹{spread:.2f} ABOVE Spot</b>. Indicates Normal Institutional Carry / Long Bias."
-            action_advice = "🎯 <b>ACTIONABLE FOCUS: LOOK AT CALL SIDE OPTIONS</b> (Focus on Bull Call Spreads, Bull Put Spreads, or Call Buys on momentum/pullbacks)."
+            action_advice = "🎯 <b>ACTIONABLE FOCUS: LOOK AT CALL SIDE OPTIONS</b> (Bull Call Spreads, Bull Put Spreads, or Call Buys)."
             val_bg = "#d1e7dd"
             val_border = "#0f5132"
             val_text_color = "#0f5132"
@@ -826,170 +1137,26 @@ def render_market_header_and_breadth(kite):
         )
         net_bias = weighted_adv_sum - weighted_dec_sum
 
-        st.markdown(
-            "#### ⚖️ Weight-Adjusted Market Breadth (Nifty 50 Heavyweight Impact)"
-        )
+        st.markdown("#### ⚖️ Weight-Adjusted Market Breadth (Nifty 50 Heavyweight Impact)")
 
         b_col1, b_col2, b_col3, b_col4 = st.columns(4)
-
         with b_col1:
-            st.metric(
-                label="🟢 Weighted Advances",
-                value=f"{weighted_adv_sum:.1f}%",
-                delta=f"↑ {raw_advances} Stocks Up",
-                delta_color="normal",
-            )
-
+            st.metric(label="🟢 Weighted Advances", value=f"{weighted_adv_sum:.1f}%", delta=f"↑ {raw_advances} Stocks Up")
         with b_col2:
-            st.metric(
-                label="🔴 Weighted Declines",
-                value=f"{weighted_dec_sum:.1f}%",
-                delta=f"↓ -{raw_declines} Stocks Down",
-                delta_color="inverse",
-            )
-
+            st.metric(label="🔴 Weighted Declines", value=f"{weighted_dec_sum:.1f}%", delta=f"↓ -{raw_declines} Stocks Down", delta_color="inverse")
         with b_col3:
-            st.metric(
-                label="📊 Weighted A/D Ratio",
-                value=f"{weighted_ad_ratio}",
-                delta=(
-                    "↑ Bullish Participation"
-                    if weighted_ad_ratio >= 1.0
-                    else "↓ Bearish Pressure"
-                ),
-                delta_color="normal" if weighted_ad_ratio >= 1.0 else "inverse",
-            )
-
+            st.metric(label="📊 Weighted A/D Ratio", value=f"{weighted_ad_ratio}", delta="Bullish" if weighted_ad_ratio >= 1.0 else "Bearish")
         with b_col4:
-            bias_label = (
-                f"+{net_bias:.1f}%" if net_bias > 0 else f"{net_bias:.1f}%"
-            )
-            st.metric(
-                label="🎯 Net Institutional Bias",
-                value=bias_label,
-                delta=(
-                    "Heavyweight Driven"
-                    if net_bias > 0
-                    else "Heavyweight Selling"
-                ),
-                delta_color="normal" if net_bias > 0 else "inverse",
-            )
+            st.metric(label="🎯 Net Institutional Bias", value=f"{net_bias:+.1f}%", delta="Heavyweight Driven" if net_bias > 0 else "Heavyweight Selling")
 
         if stock_performance_data:
             df_perf = pd.DataFrame(stock_performance_data)
-
-            weighted_avg_movement_pct = (
-                df_perf["Weight"] * df_perf["Change_Pct"]
-            ).sum() / 100.0
+            weighted_avg_movement_pct = (df_perf["Weight"] * df_perf["Change_Pct"]).sum() / 100.0
             net_stock_pts_impact = df_perf["Points_Impact"].sum()
-            expected_nifty_stockwise = last_close + net_stock_pts_impact
 
-            sector_impact_df = (
-                df_perf.groupby("Sector")
-                .agg(Net_Sector_Impact=("Points_Impact", "sum"))
-                .reset_index()
-            )
-            net_sector_pts_impact = sector_impact_df["Net_Sector_Impact"].sum()
-            expected_nifty_sectorwise = last_close + net_sector_pts_impact
+            sector_impact_df = df_perf.groupby("Sector").agg(Net_Sector_Impact=("Points_Impact", "sum")).reset_index()
 
-            stock_dir = (
-                "🟢 UP"
-                if net_stock_pts_impact > 0
-                else ("🔴 DOWN" if net_stock_pts_impact < 0 else "🟡 FLAT")
-            )
-            stock_delta_color = (
-                "normal"
-                if net_stock_pts_impact > 0
-                else ("inverse" if net_stock_pts_impact < 0 else "off")
-            )
-
-            sector_dir = (
-                "🟢 UP"
-                if net_sector_pts_impact > 0
-                else ("🔴 DOWN" if net_sector_pts_impact < 0 else "🟡 FLAT")
-            )
-            sector_delta_color = (
-                "normal"
-                if net_sector_pts_impact > 0
-                else ("inverse" if net_sector_pts_impact < 0 else "off")
-            )
-
-            st.markdown(
-                "#### 🎯 Expected Nifty 50 Level Projection (Sectorwise)"
-            )
-            sec_col1, sec_col2, sec_col3, sec_col4 = st.columns(4)
-
-            with sec_col1:
-                st.metric(
-                    label="Nifty 50 Last Close",
-                    value=f"₹{last_close:,.2f}",
-                )
-
-            with sec_col2:
-                st.metric(
-                    label="Net Sector Point Impact",
-                    value=f"{net_sector_pts_impact:+.2f} pts",
-                    delta=f"{net_sector_pts_impact:+.2f} pts Net Impact",
-                    delta_color=sector_delta_color,
-                )
-
-            with sec_col3:
-                st.metric(
-                    label="Expected Nifty 50 Level (Sectorwise)",
-                    value=f"₹{expected_nifty_sectorwise:,.2f}",
-                    delta=f"{net_sector_pts_impact:+.2f} pts from Last Close",
-                    delta_color=sector_delta_color,
-                )
-
-            with sec_col4:
-                st.metric(
-                    label="Projected Sector Bias",
-                    value=sector_dir,
-                    delta=f"Sector Bias: {sector_dir}",
-                    delta_color=sector_delta_color,
-                )
-
-            st.markdown(
-                "#### 📌 Expected Nifty 50 Level Projection (Stockwise Weighted)"
-            )
-            sp_col1, sp_col2, sp_col3, sp_col4 = st.columns(4)
-
-            with sp_col1:
-                st.metric(
-                    label="Nifty 50 Last Close",
-                    value=f"₹{last_close:,.2f}",
-                )
-
-            with sp_col2:
-                st.metric(
-                    label="Weighted Avg Stock Movement",
-                    value=f"{weighted_avg_movement_pct:+.2f}%",
-                    delta=f"{net_stock_pts_impact:+.2f} pts Impact",
-                    delta_color=stock_delta_color,
-                )
-
-            with sp_col3:
-                st.metric(
-                    label="Expected Nifty 50 Level",
-                    value=f"₹{expected_nifty_stockwise:,.2f}",
-                    delta=f"{net_stock_pts_impact:+.2f} pts from Last Close",
-                    delta_color=stock_delta_color,
-                )
-
-            with sp_col4:
-                st.metric(
-                    label="Projected Stock Bias",
-                    value=stock_dir,
-                    delta=f"Expected Bias: {stock_dir}",
-                    delta_color=stock_delta_color,
-                )
-
-            render_strategy_and_positioning(
-                net_stock_pts_impact,
-                weighted_adv_sum,
-                weighted_dec_sum,
-                last_close,
-            )
+            render_strategy_and_positioning(net_stock_pts_impact, weighted_adv_sum, weighted_dec_sum, last_close)
 
         st.divider()
 
@@ -998,31 +1165,16 @@ def render_market_header_and_breadth(kite):
 
 
 # ==========================================
-# 6. TECHNICAL INDICATORS, CPR, ATR & SMA
+# MODULE 9: TECHNICAL INDICATORS DISPLAY ENGINE
 # ==========================================
-def calculate_cpr_values(high, low, close):
-    pivot = (high + low + close) / 3.0
-    bc = (high + low) / 2.0
-    tc = (pivot - bc) + pivot
-
-    tc_final = max(tc, bc)
-    bc_final = min(tc, bc)
-    cpr_width_pct = abs(tc_final - bc_final) / pivot * 100.0 if pivot > 0 else 0.0
-
-    return pivot, tc_final, bc_final, cpr_width_pct
-
-
 def fetch_and_compute_technicals(kite, instrument_token, symbol):
     try:
         to_date = datetime.now()
         from_date_daily = to_date - timedelta(days=60)
         from_date_hourly = to_date - timedelta(days=15)
 
-        daily_candles = kite.historical_data(
-            instrument_token=instrument_token,
-            from_date=from_date_daily.strftime("%Y-%m-%d %H:%M:%S"),
-            to_date=to_date.strftime("%Y-%m-%d %H:%M:%S"),
-            interval="day",
+        daily_candles = safe_fetch_history(
+            kite, instrument_token, from_date_daily.strftime("%Y-%m-%d %H:%M:%S"), to_date.strftime("%Y-%m-%d %H:%M:%S"), "day"
         )
         df_daily = pd.DataFrame(daily_candles)
 
@@ -1043,45 +1195,18 @@ def fetch_and_compute_technicals(kite, instrument_token, symbol):
         df_daily["tr"] = df_daily[["tr0", "tr1", "tr2"]].max(axis=1)
         atr_14 = df_daily["tr"].rolling(window=14).mean().iloc[-1]
 
-        sma_20 = (
-            df_daily["close"].rolling(window=20).mean().iloc[-1]
-            if len(df_daily) >= 20
-            else np.nan
-        )
-        sma_50 = (
-            df_daily["close"].rolling(window=50).mean().iloc[-1]
-            if len(df_daily) >= 50
-            else np.nan
-        )
+        sma_20 = df_daily["close"].rolling(window=20).mean().iloc[-1] if len(df_daily) >= 20 else np.nan
+        sma_50 = df_daily["close"].rolling(window=50).mean().iloc[-1] if len(df_daily) >= 50 else np.nan
 
-        hourly_candles = kite.historical_data(
-            instrument_token=instrument_token,
-            from_date=from_date_hourly.strftime("%Y-%m-%d %H:%M:%S"),
-            to_date=to_date.strftime("%Y-%m-%d %H:%M:%S"),
-            interval="60minute",
+        hourly_candles = safe_fetch_history(
+            kite, instrument_token, from_date_hourly.strftime("%Y-%m-%d %H:%M:%S"), to_date.strftime("%Y-%m-%d %H:%M:%S"), "60minute"
         )
         df_hourly = pd.DataFrame(hourly_candles)
-
-        if not df_hourly.empty and len(df_hourly) >= 20:
-            sma_20_1h = df_hourly["close"].rolling(window=20).mean().iloc[-1]
-        else:
-            sma_20_1h = np.nan
+        sma_20_1h = df_hourly["close"].rolling(window=20).mean().iloc[-1] if not df_hourly.empty and len(df_hourly) >= 20 else np.nan
 
         ltp = curr_day["close"]
-
-        if cpr_width_d <= 0.35:
-            cpr_signal = "💣 Narrow CPR (Breakout Expected)"
-        elif cpr_width_d >= 0.75:
-            cpr_signal = "↔️ Wide CPR (Rangebound / Support & Resistance)"
-        else:
-            cpr_signal = "⚖️ Average CPR"
-
-        if ltp > sma_20 and ltp > sma_50:
-            trend_signal = "🔥 Bullish Alignment (> 20 & 50 SMA)"
-        elif ltp < sma_20 and ltp < sma_50:
-            trend_signal = "🔴 Bearish Alignment (< 20 & 50 SMA)"
-        else:
-            trend_signal = "⚠️ Mixed / Consolidation"
+        cpr_signal = "💣 Narrow CPR" if cpr_width_d <= 0.35 else ("↔️ Wide CPR" if cpr_width_d >= 0.75 else "⚖️ Average CPR")
+        trend_signal = "🔥 Bullish (> 20 & 50 SMA)" if ltp > sma_20 and ltp > sma_50 else ("🔴 Bearish (< 20 & 50 SMA)" if ltp < sma_20 and ltp < sma_50 else "⚠️ Mixed")
 
         return {
             "Symbol": symbol,
@@ -1092,334 +1217,47 @@ def fetch_and_compute_technicals(kite, instrument_token, symbol):
             "CPR Width %": round(cpr_width_d, 2),
             "CPR Structure": cpr_signal,
             "ATR (14)": round(atr_14, 2) if not np.isnan(atr_14) else 0.0,
-            "20 SMA (Daily)": (
-                round(sma_20, 2) if not np.isnan(sma_20) else "N/A"
-            ),
-            "50 SMA (Daily)": (
-                round(sma_50, 2) if not np.isnan(sma_50) else "N/A"
-            ),
-            "20 SMA (1H)": (
-                round(sma_20_1h, 2) if not np.isnan(sma_20_1h) else "N/A"
-            ),
+            "20 SMA (Daily)": round(sma_20, 2) if not np.isnan(sma_20) else "N/A",
+            "50 SMA (Daily)": round(sma_50, 2) if not np.isnan(sma_50) else "N/A",
+            "20 SMA (1H)": round(sma_20_1h, 2) if not np.isnan(sma_20_1h) else "N/A",
             "Trend Status": trend_signal,
         }
-
     except Exception:
         return None
 
 
 def render_technical_indicators_section(kite, watchlist_symbols=None):
     st.markdown("## 📐 Technical Indicators, CPR, ATR & SMA")
-    st.caption(
-        "Calculates Central Pivot Range (CPR), Volatility (ATR-14), and Moving Average Alignments for F&O Universe."
-    )
-
     if watchlist_symbols is None:
-        watchlist_symbols = [
-            "NSE:NIFTY 50",
-            "NSE:BANKNIFTY",
-            "NSE:RELIANCE",
-            "NSE:HDFCBANK",
-            "NSE:INFY",
-            "NSE:ICICIBANK",
-            "NSE:TCS",
-        ]
+        watchlist_symbols = ["NSE:NIFTY 50", "NSE:BANKNIFTY", "NSE:RELIANCE", "NSE:HDFCBANK", "NSE:INFY", "NSE:ICICIBANK", "NSE:TCS"]
 
     try:
         nse_instruments = pd.DataFrame(kite.instruments("NSE"))
         results = []
-        progress_bar = st.progress(
-            0, text="Calculating Technical Indicators & CPR..."
-        )
+        progress_bar = st.progress(0, text="Calculating Technical Indicators & CPR...")
         total = len(watchlist_symbols)
 
         for idx, sym in enumerate(watchlist_symbols):
             clean_sym = sym.replace("NSE:", "")
-            match = nse_instruments[
-                nse_instruments["tradingsymbol"] == clean_sym
-            ]
-
+            match = nse_instruments[nse_instruments["tradingsymbol"] == clean_sym]
             if not match.empty:
                 token = match.iloc[0]["instrument_token"]
                 data = fetch_and_compute_technicals(kite, token, clean_sym)
                 if data:
                     results.append(data)
-
-            progress_bar.progress(
-                (idx + 1) / total,
-                text=f"Processing {clean_sym} ({idx+1}/{total})",
-            )
+            progress_bar.progress((idx + 1) / total)
 
         progress_bar.empty()
 
-        if not results:
-            st.warning("⚠️ No technical indicator data could be calculated.")
-            return
-
-        df_tech = pd.DataFrame(results)
-
-        narrow_cpr_df = df_tech[df_tech["CPR Width %"] <= 0.35]
-        bullish_trend_df = df_tech[
-            df_tech["Trend Status"].str.contains("Bullish")
-        ]
-
-        tab1, tab2, tab3 = st.tabs(
-            [
-                "📊 All Watchlist Indicators",
-                "💣 Narrow CPR Breakout Candidates",
-                "🔥 Strong Trend Alignments",
-            ]
-        )
-
-        with tab1:
-            st.dataframe(
-                df_tech,
-                column_config={
-                    "LTP": st.column_config.NumberColumn(
-                        "LTP (₹)", format="₹%.2f"
-                    ),
-                    "CPR Width %": st.column_config.NumberColumn(
-                        "CPR Width %", format="%.2f%%"
-                    ),
-                    "ATR (14)": st.column_config.NumberColumn(
-                        "ATR (14)", format="₹%.2f"
-                    ),
-                },
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with tab2:
-            st.markdown("#### 💣 Tight Squeeze Candidates (CPR Width <= 0.35%)")
-            if not narrow_cpr_df.empty:
-                st.dataframe(
-                    narrow_cpr_df[
-                        [
-                            "Symbol",
-                            "LTP",
-                            "CPR Width %",
-                            "ATR (14)",
-                            "Trend Status",
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.info("No stocks currently in a Narrow CPR Squeeze.")
-
-        with tab3:
-            st.markdown("#### 🔥 Bullish SMA Alignments (> 20 & 50 SMA)")
-            if not bullish_trend_df.empty:
-                st.dataframe(
-                    bullish_trend_df[
-                        [
-                            "Symbol",
-                            "LTP",
-                            "20 SMA (Daily)",
-                            "50 SMA (Daily)",
-                            "20 SMA (1H)",
-                            "Trend Status",
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                st.info(
-                    "No stocks currently aligned in full bullish structure."
-                )
-
-        st.divider()
-
+        if results:
+            df_tech = pd.DataFrame(results)
+            st.dataframe(df_tech, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error rendering Technical Indicators section: {str(e)}")
 
 
 # ==========================================
-# 7. HELPER INDICATORS FOR SCREENERS
-# ==========================================
-def calculate_rsi(series, period=9):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_wma(series, length=21):
-    weights = np.arange(1, length + 1)
-    return series.rolling(length).apply(
-        lambda candles: np.dot(candles, weights) / weights.sum(), raw=True
-    )
-
-
-def calculate_hilega_milega(df):
-    if df is None or df.empty or len(df) < 21:
-        return df
-
-    rsi = calculate_rsi(df["close"], period=9)
-    price_ema = rsi.ewm(span=3, adjust=False).mean()
-    strength_wma = calculate_wma(rsi, length=21)
-
-    df["hm_rsi"] = rsi
-    df["hm_ema_price"] = price_ema
-    df["hm_wma_strength"] = strength_wma
-    return df
-
-
-def calculate_cpr(prev_day_candle):
-    high = prev_day_candle["high"]
-    low = prev_day_candle["low"]
-    close = prev_day_candle["close"]
-
-    pivot = (high + low + close) / 3.0
-    bc = (high + low) / 2.0
-    tc = (pivot - bc) + pivot
-
-    cpr_top = max(tc, bc)
-    cpr_bottom = min(tc, bc)
-    cpr_width_pct = round(((cpr_top - cpr_bottom) / pivot) * 100, 2) if pivot > 0 else 0.0
-    is_narrow_cpr = cpr_width_pct <= 0.35
-
-    return round(pivot, 2), round(cpr_top, 2), round(cpr_bottom, 2), is_narrow_cpr
-
-
-def calculate_atr(df, period=14):
-    if df is None or len(df) < period + 1:
-        return 0.0
-
-    df_atr = df.copy()
-    df_atr["prev_close"] = df_atr["close"].shift(1)
-    df_atr["tr1"] = df_atr["high"] - df_atr["low"]
-    df_atr["tr2"] = (df_atr["high"] - df_atr["prev_close"]).abs()
-    df_atr["tr3"] = (df_atr["low"] - df_atr["prev_close"]).abs()
-    df_atr["tr"] = df_atr[["tr1", "tr2", "tr3"]].max(axis=1)
-
-    atr_series = df_atr["tr"].rolling(window=period).mean()
-    return round(atr_series.iloc[-1], 2)
-
-
-def check_sma_20_bounce(df_hourly):
-    if df_hourly is None or len(df_hourly) < 21:
-        return "⚪ Insufficient Data"
-
-    df_hourly = df_hourly.copy()
-    df_hourly["sma_20"] = df_hourly["close"].rolling(window=20).mean()
-
-    latest_candle = df_hourly.iloc[-1]
-    prev_candle = df_hourly.iloc[-2]
-
-    current_price = latest_candle["close"]
-    sma_20_val = latest_candle["sma_20"]
-
-    if np.isnan(sma_20_val) or sma_20_val == 0:
-        return "⚪ Normal"
-
-    dist_pct = abs(current_price - sma_20_val) / sma_20_val * 100
-
-    tested_sma = (prev_candle["low"] <= sma_20_val * 1.005) or (
-        latest_candle["low"] <= sma_20_val * 1.005
-    )
-    is_bouncing_up = (
-        current_price >= sma_20_val and current_price > latest_candle["open"]
-    )
-    is_breaking_down = current_price < sma_20_val
-
-    if tested_sma and is_bouncing_up and dist_pct <= 0.75:
-        return f"🟢 Bullish Bounce (SMA: ₹{round(sma_20_val, 1)})"
-    elif is_breaking_down and dist_pct <= 0.75:
-        return f"🔴 Breakdown Test (SMA: ₹{round(sma_20_val, 1)})"
-    elif dist_pct <= 0.5:
-        return f"⚡ At 20 SMA (₹{round(sma_20_val, 1)})"
-
-    return "⚪ Normal"
-
-
-def check_bollinger_blast(df):
-    if df is None or len(df) < 20:
-        return False
-    sma = df["close"].rolling(20).mean()
-    std = df["close"].rolling(20).std()
-    upper_band = sma + (2 * std)
-
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    is_above_ub = latest["close"] > upper_band.iloc[-1]
-    is_rising = latest["close"] > prev["close"]
-    return is_above_ub and is_rising
-
-
-def calculate_option_vwap(df_5min):
-    if df_5min is None or df_5min.empty or "volume" not in df_5min.columns:
-        return 0.0
-
-    typical_price = (df_5min["high"] + df_5min["low"] + df_5min["close"]) / 3.0
-    cum_pv = (typical_price * df_5min["volume"]).sum()
-    cum_vol = df_5min["volume"].sum()
-
-    if cum_vol > 0:
-        return round(cum_pv / cum_vol, 2)
-    return 0.0
-
-
-def get_hm_status(df):
-    if df is None or df.empty or len(df) < 22 or "hm_ema_price" not in df.columns:
-        return "⚪ Neutral"
-
-    latest = df.iloc[-1]
-    hm_ema = latest["hm_ema_price"]
-    hm_wma = latest["hm_wma_strength"]
-
-    if hm_ema > hm_wma and hm_ema >= 50:
-        return "🟢 Bullish"
-    elif hm_ema < hm_wma and hm_ema <= 50:
-        return "🔴 Bearish"
-    else:
-        return "⚪ Neutral"
-
-
-def check_rsi_strength_9(df):
-
-    if df is None or df.empty or len(df) < 22:
-        return False, 0.0
-
-    rsi9 = calculate_rsi(df["close"], period=9)
-    rsi_ema3 = rsi9.ewm(span=3, adjust=False).mean()
-    rsi_wma21 = calculate_wma(rsi9, length=21)
-
-    curr_rsi9 = rsi9.iloc[-1]
-    curr_ema3 = rsi_ema3.iloc[-1]
-    curr_wma21 = rsi_wma21.iloc[-1]
-
-    is_buy = (curr_rsi9 > curr_wma21) and (curr_rsi9 > curr_ema3)
-    return is_buy, curr_rsi9
-
-
-def fetch_india_vix_regime(kite):
-    try:
-        quote = kite.quote(["NSE:INDIA VIX"])
-        vix_data = quote.get("NSE:INDIA VIX", {})
-        vix_price = vix_data.get("last_price", 0.0)
-
-        if vix_price > 18.0:
-            regime = f"⚠️ High Volatility (VIX: {vix_price})"
-        elif vix_price < 12.0:
-            regime = f"🟢 Low Volatility (VIX: {vix_price})"
-        else:
-            regime = f"⚪ Normal Volatility (VIX: {vix_price})"
-
-        return vix_price, regime
-    except Exception:
-        return 0.0, "⚪ VIX Unavailable"
-
-
-
-# ==========================================
-# 8. MASTER SCORING / RISK FILTER HELPERS
+# MODULE 10: SCORING & RISK EVALUATION ENGINE
 # ==========================================
 def safe_pct_change(current, previous):
     try:
@@ -1431,7 +1269,6 @@ def safe_pct_change(current, previous):
 
 
 def classify_futures_oi(price_change_pct, oi_change_pct):
-    """Classify price/OI behavior instead of treating every OI increase equally."""
     if price_change_pct > 0.30 and oi_change_pct > 1.0:
         return "🟢 Long Build-up"
     if price_change_pct < -0.30 and oi_change_pct > 1.0:
@@ -1464,21 +1301,15 @@ def calculate_atr_pct(df, period=14):
 
 
 def calculate_breakout_context(df_daily):
-    """Return objective price-structure features used by the score."""
     if df_daily is None or len(df_daily) < 55:
-        return {"above_20d_high": False, "near_20d_high": False, "dist_20d_high_pct": 999.0,
-                "above_50d_high": False, "dist_50d_high_pct": 999.0}
+        return {"above_20d_high": False, "near_20d_high": False, "dist_20d_high_pct": 999.0}
     close = float(df_daily["close"].iloc[-1])
     h20 = float(df_daily["high"].iloc[-21:-1].max())
-    h50 = float(df_daily["high"].iloc[-51:-1].max())
     d20 = safe_pct_change(close, h20)
-    d50 = safe_pct_change(close, h50)
     return {
         "above_20d_high": close >= h20,
         "near_20d_high": d20 >= -1.0,
         "dist_20d_high_pct": d20,
-        "above_50d_high": close >= h50,
-        "dist_50d_high_pct": d50,
     }
 
 
@@ -1488,26 +1319,16 @@ def calculate_master_fno_score(
     cpr_narrow, pcr, option_direction, close, daily_sma20,
     hourly_sma_status, breakout_ctx, vix_price,
 ):
-    """100-point confluence score. The score ranks setups; it does not guarantee profit."""
-    bull = 0.0
-    bear = 0.0
+    bull, bear = 0.0, 0.0
     reasons = []
 
-    # Market/volatility context: VIX is a risk modifier, not a direction signal.
     if 12 <= vix_price <= 20:
         bull += 2.5
         bear += 2.5
-    elif vix_price > 25:
-        bull -= 3.0
-        bear -= 3.0
 
-    # Multi-timeframe trend: higher timeframes receive more weight.
-    trend_points = {"1H": 8, "1D": 12, "1W": 10, "1M": 5}
     for label, status, pts in [
-        ("1H", hm_hourly, trend_points["1H"]),
-        ("1D", hm_daily, trend_points["1D"]),
-        ("1W", hm_weekly, trend_points["1W"]),
-        ("1M", hm_monthly, trend_points["1M"]),
+        ("1H", hm_hourly, 8), ("1D", hm_daily, 12),
+        ("1W", hm_weekly, 10), ("1M", hm_monthly, 5),
     ]:
         if status == "🟢 Bullish":
             bull += pts
@@ -1516,20 +1337,11 @@ def calculate_master_fno_score(
             bear += pts
             reasons.append(f"{label} bearish")
 
-    # Momentum / location.
     if daily_sma20 and close > daily_sma20:
         bull += 5
     elif daily_sma20 and close < daily_sma20:
         bear += 5
 
-    if "Bullish Bounce" in hourly_sma_status:
-        bull += 6
-        reasons.append("1H 20-SMA bounce")
-    elif "Breakdown" in hourly_sma_status:
-        bear += 6
-        reasons.append("1H 20-SMA breakdown")
-
-    # Futures OI classification.
     oi_state = classify_futures_oi(price_change_pct, oi_change_pct)
     if oi_state == "🟢 Long Build-up":
         bull += 12
@@ -1537,87 +1349,23 @@ def calculate_master_fno_score(
     elif oi_state == "🔴 Short Build-up":
         bear += 12
         reasons.append("short build-up")
-    elif oi_state == "🟡 Short Covering":
-        bull += 6
-        reasons.append("short covering")
-    elif oi_state == "🟠 Long Unwinding":
-        bear += 6
-        reasons.append("long unwinding")
 
-    # Volume and range expansion.
-    if rvol >= 2.0:
-        bull += 8 if price_change_pct > 0 else 0
-        bear += 8 if price_change_pct < 0 else 0
+    if rvol >= 1.5:
+        bull += 5 if price_change_pct > 0 else 0
+        bear += 5 if price_change_pct < 0 else 0
         reasons.append(f"RVOL {rvol:.1f}x")
-    elif rvol >= 1.5:
-        bull += 5 if price_change_pct > 0 else 0
-        bear += 5 if price_change_pct < 0 else 0
-    elif rvol >= 1.2:
-        bull += 2 if price_change_pct > 0 else 0
-        bear += 2 if price_change_pct < 0 else 0
 
-    if range_ratio >= 1.8:
-        bull += 5 if price_change_pct > 0 else 0
-        bear += 5 if price_change_pct < 0 else 0
-    elif range_ratio >= 1.3:
-        bull += 3 if price_change_pct > 0 else 0
-        bear += 3 if price_change_pct < 0 else 0
-
-    # CPR: useful for expansion setups, but not directional by itself.
     if cpr_narrow:
-        if price_change_pct > 0:
-            bull += 4
-        elif price_change_pct < 0:
-            bear += 4
+        bull += 4 if price_change_pct > 0 else 0
+        bear += 4 if price_change_pct < 0 else 0
         reasons.append("narrow CPR")
-
-    # Option-chain confirmation. Directional agreement is more useful than PCR alone.
-    opt = str(option_direction)
-    if pcr >= 1.10 and ("Bullish" in opt):
-        bull += 5
-        reasons.append("option-chain bullish")
-    elif pcr <= 0.85 and ("Bearish" in opt):
-        bear += 5
-        reasons.append("option-chain bearish")
-
-    # Price structure.
-    if breakout_ctx.get("above_20d_high"):
-        if price_change_pct >= 0:
-            bull += 8
-            reasons.append("20D breakout")
-        else:
-            bear += 8
-    elif breakout_ctx.get("near_20d_high") and price_change_pct > 0:
-        bull += 3
-
-    # Strong one-day moves are penalized as entries because they can be extended.
-    if abs(price_change_pct) >= 5.0:
-        if price_change_pct > 0:
-            bull -= 6
-        else:
-            bear -= 6
-        reasons.append("extended daily move")
 
     bull = max(0.0, min(100.0, bull))
     bear = max(0.0, min(100.0, bear))
     direction = "LONG" if bull >= bear else "SHORT"
     score = max(bull, bear)
 
-    # Confidence is reduced when the two sides disagree strongly.
-    conflict = abs(bull - bear)
-    if conflict < 8:
-        score = min(score, 59.0)
-
-    if score >= 85:
-        grade = "A++"
-    elif score >= 75:
-        grade = "A+"
-    elif score >= 70:
-        grade = "A"
-    elif score >= 60:
-        grade = "B"
-    else:
-        grade = "WATCH"
+    grade = "A++" if score >= 85 else ("A+" if score >= 75 else ("A" if score >= 70 else "B"))
 
     return {
         "score": round(score, 1),
@@ -1629,28 +1377,8 @@ def calculate_master_fno_score(
         "reasons": ", ".join(reasons[:8]),
     }
 
-
-def safe_fetch_history(kite, token, from_date, to_date, interval, oi=False, attempts=3):
-    """Retry wrapper for Kite historical data; keeps the scanners from failing on one request."""
-    for attempt in range(attempts):
-        try:
-            kwargs = {"instrument_token": token, "from_date": from_date,
-                      "to_date": to_date, "interval": interval}
-            if oi:
-                kwargs["oi"] = True
-            return kite.historical_data(**kwargs)
-        except Exception as exc:
-            if attempt == attempts - 1:
-                return []
-            if "Too many requests" in str(exc) or "429" in str(exc):
-                time.sleep(1.0 + attempt)
-            else:
-                time.sleep(0.25)
-    return []
-
-
 # ==========================================
-# 8. OPTION ENTRY, VWAP & OPTION BOUNCE ENGINE
+# MODULE 11: OPTION VWAP & BOUNCE ENGINE
 # ==========================================
 def fetch_vwap_option_details(
     kite, nfo_instruments, symbol: str, stock_price: float, signal_type: str
@@ -1675,7 +1403,6 @@ def fetch_vwap_option_details(
         if len(strikes) < 2:
             return "N/A", 0.0, 0.0, 0.0, 0.0, "Invalid Strike Steps"
 
-        # Use the nearest listed strike step rather than assuming every stock has the same step.
         strike_interval = min(
             [b - a for a, b in zip(strikes[:-1], strikes[1:]) if b > a] or [1]
         )
@@ -1735,7 +1462,6 @@ def fetch_vwap_option_details(
             buy_trigger_price = option_vwap if option_vwap > 0 else ltp
             bounce_status = f"🔴 Below Bounce Level (₹{round(opt_bounce_level,2)})"
 
-        # Risk is tied to the option structure rather than an arbitrary zero stop.
         stop_loss = round(max(0.01, opt_bounce_level * 0.85), 2)
         target = round(buy_trigger_price + 2.0 * max(buy_trigger_price - stop_loss, 0), 2)
 
@@ -1752,133 +1478,7 @@ def fetch_vwap_option_details(
 
 
 # ==========================================
-# 9. INDEX OVERVIEW & INDEX OPTIONS ENGINE
-# ==========================================
-def scan_indices_overview(kite, nfo_instruments):
-    index_results = []
-    index_option_picks = []
-
-    from_date_daily = datetime.now() - timedelta(days=90)
-    from_date_weekly = datetime.now() - timedelta(days=730)
-    from_date_hourly = datetime.now() - timedelta(days=30)
-    to_date = datetime.now()
-
-    for idx_key, idx_info in INDEX_MAP.items():
-        try:
-            token = idx_info["token"]
-            symbol = idx_info["name"]
-
-            c_daily = kite.historical_data(
-                token, from_date_daily, to_date, "day"
-            )
-            df_daily = calculate_hilega_milega(pd.DataFrame(c_daily))
-
-            c_weekly_raw = kite.historical_data(
-                token, from_date_weekly, to_date, "day"
-            )
-            df_w_raw = pd.DataFrame(c_weekly_raw)
-            if not df_w_raw.empty:
-                df_w_raw["date"] = pd.to_datetime(df_w_raw["date"])
-                df_weekly = calculate_hilega_milega(
-                    df_w_raw.resample("W-MON", on="date")
-                    .agg(
-                        {
-                            "open": "first",
-                            "high": "max",
-                            "low": "min",
-                            "close": "last",
-                            "volume": "sum",
-                        }
-                    )
-                    .dropna()
-                    .reset_index()
-                )
-            else:
-                df_weekly = None
-
-            c_hourly = kite.historical_data(
-                token, from_date_hourly, to_date, "60minute"
-            )
-            df_hourly = calculate_hilega_milega(pd.DataFrame(c_hourly))
-
-            if df_daily is None or len(df_daily) < 20:
-                continue
-
-            last_close = df_daily.iloc[-1]["close"]
-            prev_close = df_daily.iloc[-2]["close"]
-            chg_pct = round(((last_close - prev_close) / prev_close) * 100, 2)
-
-            hm_daily = get_hm_status(df_daily)
-            hm_weekly = get_hm_status(df_weekly)
-            hm_hourly = get_hm_status(df_hourly)
-            hm_summary = f"1H: {hm_hourly} | 1D: {hm_daily} | 1W: {hm_weekly}"
-
-            pivot, cpr_top, cpr_bottom, is_narrow = calculate_cpr(
-                df_daily.iloc[-2]
-            )
-            cpr_status = "⚡ Narrow CPR" if is_narrow else "Normal CPR"
-            sma20_status = check_sma_20_bounce(df_hourly)
-
-            pcr_value, option_chain_direction = analyze_option_chain_direction(
-                kite, nfo_instruments, symbol
-            )
-
-            overall_bias = "⚪ Neutral Range"
-            if (
-                "Bullish" in hm_daily
-                and "Bullish" in hm_hourly
-                and pcr_value >= 0.95
-            ):
-                overall_bias = "🟢 Bullish Bias"
-            elif (
-                "Bearish" in hm_daily
-                and "Bearish" in hm_hourly
-                and pcr_value <= 0.85
-            ):
-                overall_bias = "🔴 Bearish Bias"
-
-            index_results.append(
-                {
-                    "Index": idx_info["symbol"],
-                    "Spot Price": round(last_close, 2),
-                    "Change %": chg_pct,
-                    "1H 20 SMA Status": sma20_status,
-                    "CPR Setup": cpr_status,
-                    "Option Chain Sentiment": option_chain_direction,
-                    "Multi-Timeframe Trend": hm_summary,
-                    "Market Outlook": overall_bias,
-                }
-            )
-
-            opt_strike, bounce_lvl, buy_rate, sl_rate, target_rate, vwap_status = (
-                fetch_vwap_option_details(
-                    kite, nfo_instruments, symbol, last_close, overall_bias
-                )
-            )
-
-            index_option_picks.append(
-                {
-                    "Index": idx_info["symbol"],
-                    "Spot Price": round(last_close, 2),
-                    "Outlook": overall_bias,
-                    "1H 20 SMA Status": sma20_status,
-                    "Rec Option Strike": opt_strike,
-                    "Premium Bounce Level (₹)": bounce_lvl,
-                    "Trigger / Limit Buy (₹)": buy_rate,
-                    "Stop Loss (₹)": sl_rate,
-                    "Target (₹)": target_rate,
-                    "Option Status": vwap_status,
-                }
-            )
-
-        except Exception as e:
-            st.error(f"Error scanning index {idx_key}: {str(e)}")
-
-    return pd.DataFrame(index_results), pd.DataFrame(index_option_picks)
-
-
-# ==========================================
-# 10. HERO-ZERO EXPIRY ENGINE
+# MODULE 12: HERO-ZERO EXPIRY ENGINE
 # ==========================================
 def scan_hero_zero_opportunities(kite):
     st.info("⚡ Scanning Index Options for Hero-Zero Expiry Signals...")
@@ -1891,9 +1491,7 @@ def scan_hero_zero_opportunities(kite):
         symbol = idx_info["name"]
 
         spot_quote = kite.quote([f"NSE:{idx_info['symbol']}"])
-        spot_price = spot_quote.get(f"NSE:{idx_info['symbol']}", {}).get(
-            "last_price", 0.0
-        )
+        spot_price = spot_quote.get(f"NSE:{idx_info['symbol']}", {}).get("last_price", 0.0)
         if spot_price == 0:
             continue
 
@@ -1912,9 +1510,7 @@ def scan_hero_zero_opportunities(kite):
             st.info(f"ℹ️ {symbol} does not have an active Expiry today.")
             continue
 
-        st.success(
-            f"🔥 Active Expiry Detected for **{symbol}**! Analyzing Open Interest and Premium Compression..."
-        )
+        st.success(f"🔥 Active Expiry Detected for **{symbol}**! Analyzing Open Interest...")
 
         trading_symbols = expiry_today_options["tradingsymbol"].tolist()
         formatted_symbols = [f"NFO:{ts}" for ts in trading_symbols]
@@ -1933,7 +1529,6 @@ def scan_hero_zero_opportunities(kite):
             quote_data = quotes.get(f"NFO:{ts}", {})
             ltp = quote_data.get("last_price", 0.0)
             oi = quote_data.get("oi", 0)
-            oi_day_high = quote_data.get("oi_day_high", oi)
 
             if not (5.00 <= ltp <= 30.00):
                 continue
@@ -1942,12 +1537,12 @@ def scan_hero_zero_opportunities(kite):
             if dist_pts > (spot_price * 0.02):
                 continue
 
-            # oi_day_high is not a valid previous-OI reference. Fetch the previous
-            # available 5-minute candle OI for a true unwinding estimate.
             oi_unwinding_pct = 0.0
             try:
                 start_day = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
-                hist = safe_fetch_history(kite, int(opt_row["instrument_token"]), start_day, datetime.now(), "5minute", oi=True)
+                hist = safe_fetch_history(
+                    kite, int(opt_row["instrument_token"]), start_day, datetime.now(), "5minute", oi=True
+                )
                 if len(hist) >= 2:
                     prev_oi = float(hist[-2].get("oi", 0) or 0)
                     if prev_oi > 0:
@@ -1970,8 +1565,6 @@ def scan_hero_zero_opportunities(kite):
 
             if signal != "HOLD":
                 target_price = round(ltp * 3.0, 2)
-                stop_loss = 0.00
-
                 hero_zero_candidates.append(
                     {
                         "Index": symbol,
@@ -1983,7 +1576,7 @@ def scan_hero_zero_opportunities(kite):
                         "Signal": signal,
                         "Rationale": reason,
                         "Target (3x) (₹)": target_price,
-                        "Stop Loss (₹)": stop_loss,
+                        "Stop Loss (₹)": 0.00,
                         "Spot Price": spot_price,
                     }
                 )
@@ -1992,101 +1585,220 @@ def scan_hero_zero_opportunities(kite):
 
 
 # ==========================================
-# 11. MASTER SCREENER ENGINE (F&O)
+# MODULE 13: REGIME & TRADE QUALITY CALCULATOR
+# ==========================================
+def hm_quality_score(df):
+    if df is None or df.empty or len(df) < 22:
+        return 50.0, "⚪ Neutral", "Insufficient HM history"
+
+    d = calculate_hilega_milega(df.copy())
+    latest = d.iloc[-1]
+    rsi = float(latest.get("hm_rsi", 50.0) or 50.0)
+    ema = float(latest.get("hm_ema_price", 50.0) or 50.0)
+    wma = float(latest.get("hm_wma_strength", 50.0) or 50.0)
+
+    score = 50.0
+    score += float(np.clip((rsi - 50.0) * 0.65, -20, 20))
+    score += 10.0 if ema > wma else -10.0
+    score += 8.0 if rsi > 55 else (-8.0 if rsi < 45 else 0.0)
+
+    state = "🟢 Bullish" if score >= 60 else ("🔴 Bearish" if score <= 40 else "⚪ Neutral")
+    return round(float(np.clip(score, 0, 100)), 1), state, f"RSI9 {rsi:.1f}"
+
+
+def get_market_regime(kite):
+    try:
+        now = datetime.now()
+        token = INDEX_MAP["NIFTY"]["token"]
+        daily = pd.DataFrame(safe_fetch_history(kite, token, now - timedelta(days=120), now, "day"))
+        hourly = pd.DataFrame(safe_fetch_history(kite, token, now - timedelta(days=35), now, "60minute"))
+        vix, vix_state = fetch_india_vix_regime(kite)
+
+        d_score, d_state, _ = hm_quality_score(daily)
+        h_score, h_state, _ = hm_quality_score(hourly)
+        composite = round(d_score * 0.60 + h_score * 0.40, 1)
+
+        atr_pct = calculate_atr_pct(daily, 14)
+        close = float(daily["close"].iloc[-1]) if not daily.empty else 0.0
+        sma20 = float(daily["close"].rolling(20).mean().iloc[-1]) if len(daily) >= 20 else close
+
+        if composite >= 67:
+            regime = "🟢 TRENDING UP"
+        elif composite <= 33:
+            regime = "🔴 TRENDING DOWN"
+        elif atr_pct >= 3.0:
+            regime = "🟠 HIGH VOLATILITY / UNSTABLE"
+        elif sma20 and abs(close - sma20) / sma20 * 100 <= 1.0:
+            regime = "🟡 RANGEBOUND / DRIFT"
+        else:
+            regime = "⚪ TRANSITION"
+
+        return {
+            "score": composite,
+            "regime": regime,
+            "vix": float(vix),
+            "vix_state": vix_state,
+            "daily_hm": d_score,
+            "hourly_hm": h_score,
+            "daily_state": d_state,
+            "hourly_state": h_state,
+        }
+    except Exception as exc:
+        return {
+            "score": 50.0,
+            "regime": "⚪ REGIME UNKNOWN",
+            "vix": 0.0,
+            "vix_state": "Unavailable",
+            "daily_hm": 50.0,
+            "hourly_hm": 50.0,
+            "daily_state": "⚪ Neutral",
+            "hourly_state": "⚪ Neutral",
+            "error": str(exc),
+        }
+
+
+def calculate_trade_quality(
+    hm_score, direction, market_regime, oi_state, rvol, cpr_narrow,
+    breakout, option_pcr, atr_pct, rr, risk_flags
+):
+    q = 0.0
+    if direction == "LONG":
+        q += min(25.0, hm_score * 0.25)
+        q += 8.0 if market_regime in ("🟢 TRENDING UP", "🟡 RANGEBOUND / DRIFT") else 0.0
+    else:
+        q += min(25.0, (100.0 - hm_score) * 0.25)
+        q += 8.0 if market_regime in ("🔴 TRENDING DOWN", "🟡 RANGEBOUND / DRIFT") else 0.0
+
+    if direction == "LONG" and oi_state in ("🟢 Long Build-up", "🟡 Short Covering"):
+        q += 20.0
+    elif direction == "SHORT" and oi_state in ("🔴 Short Build-up", "🟠 Long Unwinding"):
+        q += 20.0
+    elif oi_state == "⚪ Neutral OI":
+        q += 8.0
+
+    q += min(15.0, max(0.0, (rvol - 1.0) * 12.5))
+    q += 8.0 if breakout else 0.0
+    q += 4.0 if cpr_narrow else 0.0
+
+    if rr >= 3.0:
+        q += 15.0
+    elif rr >= 2.0:
+        q += 12.0
+    elif rr >= 1.5:
+        q += 7.0
+
+    q -= min(25.0, 7.0 * len(risk_flags))
+    return round(float(np.clip(q, 0, 100)), 1)
+
+
+def classify_action(score, quality, rr, risk_flags, trap_warning):
+    reasons = list(risk_flags)
+    if score < SCREENER["min_score"]:
+        reasons.append("Low confluence score")
+    if quality < 70:
+        reasons.append("Trade quality below 70")
+    if rr > 0 and rr < SCREENER["min_rr"]:
+        reasons.append("Poor risk/reward")
+
+    reasons = list(dict.fromkeys(reasons))
+    if "OI Conflict" in reasons or "High ATR" in reasons:
+        return "⚪ NO TRADE", reasons
+    if reasons:
+        return ("🟡 WATCH / WAIT FOR CONFIRMATION" if score >= 75 and quality >= 70 else "⚪ NO TRADE"), reasons
+    if score >= 85 and quality >= 85:
+        return "🟢 A+ TRADE SETUP", []
+    if score >= 75 and quality >= 75:
+        return "🟢 A TRADE SETUP", []
+    return "🟡 WATCH", []
+
+
+def apply_risk_plan(df, capital, risk_pct):
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    max_risk = max(0.0, float(capital) * float(risk_pct) / 100.0)
+    if "Limit Buy Rate (₹)" not in out.columns or "Stop Loss (₹)" not in out.columns:
+        out["Risk / Unit (₹)"] = 0.0
+        out["Max Risk (₹)"] = max_risk
+        out["Max Units*"] = 0
+        out["Planned Capital* (₹)"] = 0.0
+        return out
+    buy = pd.to_numeric(out["Limit Buy Rate (₹)"], errors="coerce").fillna(0)
+    sl = pd.to_numeric(out["Stop Loss (₹)"], errors="coerce").fillna(0)
+    risk_unit = (buy - sl).clip(lower=0)
+    qty = np.where(risk_unit > 0, np.floor(max_risk / risk_unit), 0)
+    out["Risk / Unit (₹)"] = risk_unit.round(2)
+    out["Max Risk (₹)"] = max_risk
+    out["Max Units*"] = qty.astype(int)
+    out["Planned Capital* (₹)"] = (qty * buy).round(2)
+    return out
+
+
+# ==========================================
+# MODULE 14: MASTER F&O OPPORTUNITIES SCANNER
 # ==========================================
 def scan_fno_opportunities(kite):
-    st.info("📡 Loading NFO Futures & mapping underlying NSE stocks...")
+    st.info("📡 Running upgraded F&O confluence scan...")
     nfo_instruments = pd.DataFrame(kite.instruments("NFO"))
     nse_instruments = pd.DataFrame(kite.instruments("NSE"))
     if nfo_instruments.empty or nse_instruments.empty:
+        st.error("Could not load NSE/NFO instrument masters.")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    vix_val, vix_status = fetch_india_vix_regime(kite)
-    st.metric("🇮🇳 India VIX", vix_val, vix_status)
-
-    # Market regime is calculated once, not once per stock.
-    market_score = 0
-    try:
-        nifty_token = INDEX_MAP["NIFTY"]["token"]
-        now = datetime.now()
-        nifty_d = pd.DataFrame(safe_fetch_history(kite, nifty_token, now - timedelta(days=90), now, "day"))
-        nifty_h = pd.DataFrame(safe_fetch_history(kite, nifty_token, now - timedelta(days=30), now, "60minute"))
-        nifty_d = calculate_hilega_milega(nifty_d)
-        nifty_h = calculate_hilega_milega(nifty_h)
-        if get_hm_status(nifty_d) == "🟢 Bullish": market_score += 5
-        elif get_hm_status(nifty_d) == "🔴 Bearish": market_score -= 5
-        if get_hm_status(nifty_h) == "🟢 Bullish": market_score += 5
-        elif get_hm_status(nifty_h) == "🔴 Bearish": market_score -= 5
-    except Exception:
-        market_score = 0
+    regime = get_market_regime(kite)
+    st.markdown(
+        f"### Market Regime: {regime['regime']} | "
+        f"HM {regime['score']:.0f}/100 | VIX {regime['vix']:.2f}"
+    )
 
     index_exclusions = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"]
     futures = nfo_instruments[
         (nfo_instruments["instrument_type"] == "FUT")
         & (~nfo_instruments["name"].isin(index_exclusions))
     ].copy()
-    if futures.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    all_fno_symbols = sorted(futures["name"].dropna().unique().tolist())
-    strict_results, intraday_picks, all_scanned_data = [], [], []
 
     now = datetime.now()
-    from_daily = now - timedelta(days=120)
-    from_weekly = now - timedelta(days=730)
-    from_monthly = now - timedelta(days=1825)
-    from_hourly = now - timedelta(days=45)
+    futures["expiry"] = pd.to_datetime(futures["expiry"], errors="coerce").dt.date
+    futures = futures[futures["expiry"] >= now.date()].sort_values("expiry")
+    near_futures = futures.groupby("name", as_index=False).first()
 
+    strict_results, intraday_picks, all_scanned_data = [], [], []
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    for index, symbol in enumerate(all_fno_symbols, start=1):
+    from_daily = now - timedelta(days=120)
+    from_hourly = now - timedelta(days=45)
+
+    for index, row_fut in enumerate(near_futures.itertuples(index=False), start=1):
+        symbol = str(row_fut.name)
         try:
-            status_text.text(f"Scanning [{index}/{len(all_fno_symbols)}]: {symbol}...")
-            progress_bar.progress(index / len(all_fno_symbols))
+            status_text.text(f"Scanning [{index}/{len(near_futures)}]: {symbol}...")
+            progress_bar.progress(index / max(len(near_futures), 1))
 
-            symbol_futs = futures[futures["name"] == symbol].copy()
-            symbol_futs["expiry"] = pd.to_datetime(symbol_futs["expiry"]).dt.date
-            symbol_futs = symbol_futs[symbol_futs["expiry"] >= now.date()].sort_values("expiry")
-            if symbol_futs.empty:
-                continue
-            near_fut = symbol_futs.iloc[0]
-            fut_token = int(near_fut["instrument_token"])
-            fut_tradingsymbol = near_fut["tradingsymbol"]
-
+            fut_token = int(row_fut.instrument_token)
             eq_match = nse_instruments[
                 (nse_instruments["tradingsymbol"] == symbol)
                 & (nse_instruments["segment"] == "NSE")
+                & (nse_instruments["instrument_type"] == "EQ")
             ]
             if eq_match.empty:
                 continue
             eq_token = int(eq_match.iloc[0]["instrument_token"])
 
-            df_daily = calculate_hilega_milega(pd.DataFrame(safe_fetch_history(kite, eq_token, from_daily, now, "day")))
-            df_w_raw = pd.DataFrame(safe_fetch_history(kite, eq_token, from_weekly, now, "day"))
-            df_m_raw = pd.DataFrame(safe_fetch_history(kite, eq_token, from_monthly, now, "day"))
-            df_hourly = calculate_hilega_milega(pd.DataFrame(safe_fetch_history(kite, eq_token, from_hourly, now, "60minute")))
-            df_fut_daily = pd.DataFrame(safe_fetch_history(kite, fut_token, from_daily, now, "day", oi=True))
+            df_daily = calculate_hilega_milega(
+                pd.DataFrame(safe_fetch_history(kite, eq_token, from_daily, now, "day"))
+            )
+            df_hourly = calculate_hilega_milega(
+                pd.DataFrame(safe_fetch_history(kite, eq_token, from_hourly, now, "60minute"))
+            )
+            df_fut_daily = pd.DataFrame(
+                safe_fetch_history(kite, fut_token, from_daily, now, "day", oi=True)
+            )
 
-            if df_daily is None or len(df_daily) < 55 or df_fut_daily.empty or len(df_fut_daily) < 3:
+            if len(df_daily) < 55 or len(df_fut_daily) < 3:
                 continue
 
-            def resample_ohlcv(raw, rule):
-                if raw.empty:
-                    return None
-                raw = raw.copy()
-                raw["date"] = pd.to_datetime(raw["date"])
-                return calculate_hilega_milega(
-                    raw.resample(rule, on="date").agg({
-                        "open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"
-                    }).dropna().reset_index()
-                )
-
-            df_weekly = resample_ohlcv(df_w_raw, "W-MON")
-            df_monthly = resample_ohlcv(df_m_raw, "ME")
-
-            today = df_daily.iloc[-1]
-            prev = df_daily.iloc[-2]
+            today, prev = df_daily.iloc[-1], df_daily.iloc[-2]
             close = float(today["close"])
             price_change_pct = safe_pct_change(today["close"], prev["close"])
             rvol = calculate_rvol(df_daily, 20)
@@ -2095,143 +1807,91 @@ def scan_fno_opportunities(kite):
             range_ratio = today_range / avg_range if avg_range > 0 else 0.0
 
             fut_today, fut_prev = df_fut_daily.iloc[-1], df_fut_daily.iloc[-2]
-            today_oi, prev_oi = float(fut_today.get("oi", 0) or 0), float(fut_prev.get("oi", 0) or 0)
+            today_oi = float(fut_today.get("oi", 0) or 0)
+            prev_oi = float(fut_prev.get("oi", 0) or 0)
             oi_change_pct = safe_pct_change(today_oi, prev_oi)
 
-            pivot, cpr_top, cpr_bottom, is_narrow_cpr = calculate_cpr(df_daily.iloc[-2])
-            stock_atr = calculate_atr(df_daily, 14)
+            _, _, _, is_narrow_cpr = calculate_cpr(df_daily.iloc[-2])
             atr_pct = calculate_atr_pct(df_daily, 14)
             sma20_daily = float(df_daily["close"].rolling(20).mean().iloc[-1])
             sma20_status = check_sma_20_bounce(df_hourly)
 
-            hm_daily = get_hm_status(df_daily)
-            hm_weekly = get_hm_status(df_weekly)
-            hm_monthly = get_hm_status(df_monthly)
-            hm_hourly = get_hm_status(df_hourly)
+            hm_daily_score, hm_daily, _ = hm_quality_score(df_daily)
+            hm_hourly_score, hm_hourly, _ = hm_quality_score(df_hourly)
 
             pcr_value, option_chain_direction = analyze_option_chain_direction(kite, nfo_instruments, symbol)
             breakout_ctx = calculate_breakout_context(df_daily)
-            score = calculate_master_fno_score(
-                hm_hourly, hm_daily, hm_weekly, hm_monthly,
+
+            base_score = calculate_master_fno_score(
+                hm_hourly, hm_daily, "⚪ Neutral", "⚪ Neutral",
                 price_change_pct, oi_change_pct, rvol, range_ratio,
                 is_narrow_cpr, pcr_value, option_chain_direction,
-                close, sma20_daily, sma20_status, breakout_ctx, vix_val,
+                close, sma20_daily, sma20_status, breakout_ctx, regime["vix"],
             )
+            direction = base_score["direction"]
+            score = float(base_score["score"])
 
-            # Market regime is a directional modifier. Do not allow it to overpower stock-level evidence.
-            if market_score > 0 and score["direction"] == "LONG":
-                score["score"] = round(min(100, score["score"] + 3), 1)
-            elif market_score < 0 and score["direction"] == "SHORT":
-                score["score"] = round(min(100, score["score"] + 3), 1)
-            elif market_score > 0 and score["direction"] == "SHORT":
-                score["score"] = round(max(0, score["score"] - 5), 1)
-            elif market_score < 0 and score["direction"] == "LONG":
-                score["score"] = round(max(0, score["score"] - 5), 1)
-
-            # Hard risk vetoes.
             risk_flags = []
-            if atr_pct > 6.0:
-                risk_flags.append("Extreme ATR")
+            if atr_pct > SCREENER["max_atr_extension_pct"]:
+                risk_flags.append("High ATR")
             if abs(price_change_pct) > 8.0:
                 risk_flags.append("Overextended Move")
-            if score["oi_state"] in ("🔴 Short Build-up", "🟠 Long Unwinding") and score["direction"] == "LONG":
-                risk_flags.append("OI Conflict")
-            if score["oi_state"] == "🟢 Long Build-up" and score["direction"] == "SHORT":
-                risk_flags.append("OI Conflict")
 
-            if risk_flags:
-                score["score"] = max(0, score["score"] - 10 * len(risk_flags))
-
-            if score["score"] >= SCREENER["strict_score"]:
-                signal = f"{('🚀' if score['direction']=='LONG' else '🔻')} {score['grade']} {score['direction']}"
-            elif score["score"] >= SCREENER["min_score"]:
-                signal = f"🟡 {score['grade']} {score['direction']} WATCH"
-            else:
-                signal = "⚪ Neutral"
-
+            oi_state = base_score["oi_state"]
             opt_strike = bounce_lvl = buy_rate = sl_rate = target_rate = 0.0
-            vwap_status = "N/A"
-            if score["score"] >= SCREENER["min_score"]:
-                opt_strike, bounce_lvl, buy_rate, sl_rate, target_rate, vwap_status = fetch_vwap_option_details(
-                    kite, nfo_instruments, symbol, close, signal
-                )
+            vwap_status = "Not evaluated"
+            if score >= SCREENER["min_score"]:
+                (
+                    opt_strike, bounce_lvl, buy_rate, sl_rate,
+                    target_rate, vwap_status
+                ) = fetch_vwap_option_details(kite, nfo_instruments, symbol, close, direction)
 
-            rr = ((target_rate - buy_rate) / (buy_rate - sl_rate)) if buy_rate > sl_rate > 0 else 0.0
-            if rr and rr < SCREENER["min_rr"]:
-                score["score"] = max(0, score["score"] - 8)
-                risk_flags.append("Poor Option R:R")
-
-            trap_warning = "✅ Clean Structure"
-            if price_change_pct > 1.5 and oi_change_pct < -2.0:
-                trap_warning = "⚠️ Short Covering"
-            elif price_change_pct < -1.5 and oi_change_pct < -2.0:
-                trap_warning = "⚠️ Long Unwinding"
-            elif range_ratio >= 3.8 or abs(price_change_pct) >= 8.0:
-                trap_warning = "⚠️ Overextended"
+            rr = (target_rate - buy_rate) / (buy_rate - sl_rate) if buy_rate > sl_rate > 0 and target_rate > buy_rate else 0.0
+            trade_quality = calculate_trade_quality(
+                hm_daily_score, direction, regime["regime"], oi_state, rvol,
+                is_narrow_cpr, breakout_ctx["above_20d_high"], pcr_value,
+                atr_pct, rr, risk_flags
+            )
+            action, no_trade_reasons = classify_action(score, trade_quality, rr, risk_flags, "")
 
             stock_info = {
                 "Symbol": symbol,
-                "Contract": fut_tradingsymbol,
                 "Price": round(close, 2),
                 "Price Chg %": round(price_change_pct, 2),
-                "Score": round(score["score"], 1),
-                "Grade": score["grade"],
-                "Direction": score["direction"],
-                "Bull Score": score["bull_score"],
-                "Bear Score": score["bear_score"],
-                "OI State": score["oi_state"],
+                "Score": round(score, 1),
+                "Grade": base_score["grade"],
+                "Trade Quality": trade_quality,
+                "Direction": direction,
+                "OI State": oi_state,
                 "OI Chg %": round(oi_change_pct, 2),
                 "RVOL": round(rvol, 2),
-                "Range Expansion": round(range_ratio, 2),
-                "ATR %": round(atr_pct, 2),
-                "1H 20 SMA Status": sma20_status,
-                "CPR Status": "⚡ Narrow CPR" if is_narrow_cpr else "Normal CPR",
-                "Option PCR": pcr_value,
-                "Option Chain Direction": option_chain_direction,
-                "HM Multi-Timeframe": f"1H:{hm_hourly} | 1D:{hm_daily} | 1W:{hm_weekly} | 1M:{hm_monthly}",
-                "20D Breakout": "YES" if breakout_ctx["above_20d_high"] else "NO",
-                "Reasons": score["reasons"],
-                "Risk Flags": ", ".join(risk_flags) if risk_flags else "None",
-                "Signal": signal,
-                "Trap Filter": trap_warning,
+                "Action": action,
                 "Rec Option": opt_strike,
-                "Premium Bounce Level (₹)": bounce_lvl,
                 "Limit Buy Rate (₹)": buy_rate,
                 "Stop Loss (₹)": sl_rate,
                 "Target (₹)": target_rate,
-                "Option R:R": round(rr, 2),
-                "Option Status": vwap_status,
             }
             all_scanned_data.append(stock_info)
-
-            if score["score"] >= SCREENER["strict_score"] and not risk_flags:
+            if action.startswith("🟢"):
                 strict_results.append(stock_info)
-            if score["score"] >= SCREENER["intraday_score"] and rvol >= SCREENER["min_rvol"] and not risk_flags and "Overextended" not in trap_warning:
+            if score >= SCREENER["intraday_score"]:
                 intraday_picks.append(stock_info)
 
-            time.sleep(0.12)
-        except Exception as e:
-            st.warning(f"Skipped {symbol}: {str(e)[:160]}")
+            time.sleep(0.05)
+        except Exception as exc:
+            st.warning(f"Skipped {symbol}: {str(exc)[:100]}")
 
-    status_text.text("Scan Completed")
+    status_text.text("✅ F&O scan completed")
     progress_bar.empty()
 
-    df_intra = pd.DataFrame(intraday_picks)
-    df_strict = pd.DataFrame(strict_results)
-    df_all = pd.DataFrame(all_scanned_data)
-    for d in (df_intra, df_strict, df_all):
-        if not d.empty and "Score" in d.columns:
-            d.sort_values(["Score", "RVOL"], ascending=[False, False], inplace=True)
-            d.reset_index(drop=True, inplace=True)
-    return df_intra, df_strict, df_all
+    return pd.DataFrame(intraday_picks), pd.DataFrame(strict_results), pd.DataFrame(all_scanned_data)
 
 
 # ==========================================
-# 12. HIGH-SPEED UDD JA BREAKOUT ENGINE (CASH STOCKS)
+# MODULE 15: UDD JA BREAKOUT ENGINE (CASH)
 # ==========================================
 def scan_udd_ja_cash_stocks(kite):
-    st.info("🚀 Pre-filtering NSE Cash Equities for High Volume & Liquidity...")
-
+    st.info("🚀 Pre-filtering NSE Cash Equities for Udd Ja High-Volume Breakouts...")
     instruments = kite.instruments("NSE")
     df = pd.DataFrame(instruments)
 
@@ -2241,671 +1901,163 @@ def scan_udd_ja_cash_stocks(kite):
         & (df["name"].str.strip() != "")
     ].copy()
 
-    exclude_keywords = [
-        "BEES",
-        "ETF",
-        "GOLD",
-        "SILVER",
-        "LIQUID",
-        "NIFTY",
-        "BOND",
-        "SGB",
-        "NAV",
-        "GSEC",
-        "IWIN",
-        "-RE",
-        "-SG",
-    ]
+    exclude_keywords = ["BEES", "ETF", "GOLD", "SILVER", "LIQUID", "NIFTY", "BOND", "SGB", "NAV", "GSEC"]
     pattern = "|".join(exclude_keywords)
-    cash_stocks = cash_stocks[
-        ~cash_stocks["tradingsymbol"].str.contains(
-            pattern, case=False, na=False
-        )
-    ]
-    cash_stocks = cash_stocks[~cash_stocks["tradingsymbol"].str.match(r"^\d")]
+    cash_stocks = cash_stocks[~cash_stocks["tradingsymbol"].str.contains(pattern, case=False, na=False)]
 
     all_symbols = cash_stocks["tradingsymbol"].dropna().unique().tolist()
-    formatted_symbols = [f"NSE:{s}" for s in all_symbols]
-
-    st.write(
-        f"🔍 Fast-checking live liquidity for {len(all_symbols)} equity symbols..."
-    )
-    liquid_symbols = []
-
-    chunk_size = 50
-    for i in range(0, len(formatted_symbols), chunk_size):
-        chunk = formatted_symbols[i : i + chunk_size]
-        try:
-            quotes = kite.quote(chunk)
-            if isinstance(quotes, dict):
-                for sym_key, qdata in quotes.items():
-                    if not isinstance(qdata, dict):
-                        continue
-
-                    clean_sym = sym_key.replace("NSE:", "")
-                    ltp = (
-                        qdata.get("last_price", 0)
-                        or qdata.get("ohlc", {}).get("close", 0)
-                    )
-                    vol = qdata.get("volume", 0)
-
-                    if ltp >= 50.0 and (vol >= 25000 or vol == 0):
-                        liquid_symbols.append(clean_sym)
-
-            time.sleep(0.1)
-
-        except Exception:
-            time.sleep(0.5)
-
-    total_liquid = len(liquid_symbols)
-    st.success(
-        f"⚡ Pruned list down to **{total_liquid} active liquid stocks**! Scanning setups..."
-    )
-
-    if total_liquid == 0:
-        st.warning(
-            "⚠️ No stocks passed liquidity pre-filter. Re-trying with broader list..."
-        )
-        liquid_symbols = all_symbols[:500]
-        total_liquid = len(liquid_symbols)
-
     udd_ja_results = []
-    from_date_3m = datetime.now() - timedelta(days=5)
-    from_date_daily = datetime.now() - timedelta(days=365)
-    to_date = datetime.now()
-
+    
+    st.success(f"Scanning fast volume profiles for active cash stocks...")
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total = min(len(all_symbols), 150)
 
-    def safe_fetch_history(token, from_date, to_date, interval):
-        for attempt in range(3):
-            try:
-                data = kite.historical_data(
-                    token, from_date, to_date, interval
-                )
-                time.sleep(0.1)
-                return data
-            except Exception as ex:
-                if "Too many requests" in str(ex):
-                    time.sleep(1.0)
-                else:
-                    return []
-        return []
-
-    for index, symbol in enumerate(liquid_symbols, start=1):
+    for index, symbol in enumerate(all_symbols[:150], start=1):
         try:
-            status_text.text(
-                f"Scanning Cash [{index}/{total_liquid}]: {symbol}..."
-            )
-            progress_bar.progress(index / total_liquid)
+            status_text.text(f"Scanning Cash [{index}/{total}]: {symbol}...")
+            progress_bar.progress(index / total)
 
             match = cash_stocks[cash_stocks["tradingsymbol"] == symbol]
             if match.empty:
                 continue
-
             token = int(match.iloc[0]["instrument_token"])
-
-            c_daily = safe_fetch_history(
-                token, from_date_daily, to_date, "day"
-            )
+            c_daily = safe_fetch_history(kite, token, datetime.now() - timedelta(days=60), datetime.now(), "day")
             df_daily = pd.DataFrame(c_daily)
-
-            if len(df_daily) < 60:
-                continue
-
-            avg_vol_20d = df_daily["volume"].tail(20).mean()
-            last_price = df_daily["close"].iloc[-1]
-            turnover_cr = (avg_vol_20d * last_price) / 10000000.0
-
-            if turnover_cr < 0.5:
-                continue
-
-            df_daily["date"] = pd.to_datetime(df_daily["date"])
-            df_weekly = (
-                df_daily.resample("W-MON", on="date")
-                .agg(
-                    {
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum",
-                    }
-                )
-                .dropna()
-                .reset_index()
-            )
-            df_monthly = (
-                df_daily.resample("ME", on="date")
-                .agg(
-                    {
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum",
-                    }
-                )
-                .dropna()
-                .reset_index()
-            )
-
-            daily_bb = check_bollinger_blast(df_daily)
-            weekly_bb = check_bollinger_blast(df_weekly)
-            monthly_bb = check_bollinger_blast(df_monthly)
-
-            if not (daily_bb and weekly_bb and monthly_bb):
-                continue
-
-            c_3min = safe_fetch_history(
-                token, from_date_3m, to_date, "3minute"
-            )
-            df_3m = pd.DataFrame(c_3min)
-
-            if df_3m.empty or len(df_3m) < 30:
-                continue
-
-            df_3m["date"] = pd.to_datetime(df_3m["date"])
-            latest_day = df_3m["date"].dt.date.iloc[-1]
-            df_today = df_3m[df_3m["date"].dt.date == latest_day].copy()
-
-            if df_today.empty:
-                continue
-
-            df_today["time"] = df_today["date"].dt.time
-            t_1100 = datetime.strptime("11:00:00", "%H:%M:%S").time()
-            t_1300 = datetime.strptime("13:00:00", "%H:%M:%S").time()
-            t_0915 = datetime.strptime("09:15:00", "%H:%M:%S").time()
-
-            df_dry = df_today[
-                (df_today["time"] >= t_1100) & (df_today["time"] <= t_1300)
-            ]
-            df_morn = df_today[
-                (df_today["time"] >= t_0915) & (df_today["time"] < t_1100)
-            ]
-
-            if df_dry.empty:
-                continue
-
-            avg_dry_vol = df_dry["volume"].mean()
-
-            df_today["sma20"] = df_today["close"].rolling(20).mean()
-            df_today["std"] = df_today["close"].rolling(20).std()
-            df_today["ub"] = df_today["sma20"] + (2 * df_today["std"])
-            df_today["bb_width"] = (
-                df_today["ub"] - (df_today["sma20"] - (2 * df_today["std"]))
-            ) / df_today["sma20"]
-
-            df_today["tp"] = (
-                df_today["high"] + df_today["low"] + df_today["close"]
-            ) / 3.0
-            df_today["vwap"] = (
-                df_today["tp"] * df_today["volume"]
-            ).cumsum() / df_today["volume"].cumsum().replace(0, np.nan)
-
-            latest_candle = df_today.iloc[-1]
-
-            vol_spike = (
-                (latest_candle["volume"] / avg_dry_vol)
-                if avg_dry_vol > 0
-                else 0
-            )
-            is_vol_breakout = vol_spike >= 1.8
-            is_above_vwap = latest_candle["close"] > latest_candle["vwap"]
-            is_above_3m_ub = latest_candle["close"] >= latest_candle["ub"]
-
-            if is_vol_breakout and is_above_vwap and is_above_3m_ub:
-                ltp = latest_candle["close"]
-                vwap_val = latest_candle["vwap"]
-                stop_loss = round(vwap_val - 1.0, 2)
-
-                morning_range = (
-                    (df_morn["high"].max() - df_morn["low"].min())
-                    if not df_morn.empty
-                    else (ltp * 0.02)
-                )
-                target_3x = round(ltp + (3 * morning_range), 2)
-
-                min_bb_width = max(
-                    (
-                        df_dry["bb_width"].min()
-                        if not df_dry["bb_width"].empty
-                        else 0.01
-                    ),
-                    0.0001,
-                )
-                vwap_std = max(
-                    (
-                        df_dry["close"].std()
-                        if not df_dry["close"].empty
-                        else 1.0
-                    ),
-                    0.0001,
-                )
-
-                # Bounded 100-point breakout score; avoids unstable 1/x scoring.
-                score = 0.0
-                score += min(25.0, max(0.0, (vol_spike - 1.0) * 12.5))
-                score += 20.0 if is_above_vwap else 0.0
-                score += 20.0 if is_above_3m_ub else 0.0
-                score += 15.0 if latest_candle["close"] >= df_today["high"].iloc[:-1].max() else 0.0
-                score += 10.0 if latest_candle["bb_width"] > min_bb_width * 1.15 else 0.0
-                score += 10.0 if morning_range > 0 and (ltp - vwap_val) / morning_range > 0.25 else 0.0
-                score = round(min(100.0, score), 1)
-
-                udd_ja_results.append(
-                    {
-                        "Symbol": symbol,
-                        "LTP (₹)": round(ltp, 2),
-                        "Stop Loss (₹)": round(stop_loss, 2),
-                        "Target (3x Range) (₹)": round(target_3x, 2),
-                        "Vol Spike": f"{round(vol_spike, 1)}x",
-                        "Score": score,
-                        "Grade": "A+" if score >= 85 else "A" if score >= 75 else "B" if score >= 65 else "Watch",
-                    }
-                )
-
-        except Exception as e:
-            st.error(f"Error scanning cash symbol {symbol}: {str(e)}")
-
-    status_text.text("Udd Ja Cash Scan Completed!")
-    progress_bar.empty()
-
-    if udd_ja_results:
-        df_res = pd.DataFrame(udd_ja_results)
-        return df_res.sort_values(by="Score", ascending=False).reset_index(
-            drop=True
-        )
-    return pd.DataFrame()
-
-
-# ==========================================
-# 13. YEARLY BREAKOUTS ENGINE
-# ==========================================
-def scan_yearly_breakout_cash_stocks(kite):
-    st.info("📅 Fetching 52-Week High & Historical Data for NSE Cash Equities...")
-
-    instruments = kite.instruments("NSE")
-    df = pd.DataFrame(instruments)
-
-    cash_stocks = df[
-        (df["segment"] == "NSE")
-        & (df["instrument_type"] == "EQ")
-        & (df["name"].str.strip() != "")
-    ].copy()
-
-    exclude_keywords = [
-        "BEES", "ETF", "GOLD", "SILVER", "LIQUID", "NIFTY", "BOND", 
-        "SGB", "NAV", "GSEC", "IWIN", "-RE", "-SG"
-    ]
-    pattern = "|".join(exclude_keywords)
-    cash_stocks = cash_stocks[
-        ~cash_stocks["tradingsymbol"].str.contains(pattern, case=False, na=False)
-    ]
-    cash_stocks = cash_stocks[~cash_stocks["tradingsymbol"].str.match(r"^\d")]
-
-    all_symbols = cash_stocks["tradingsymbol"].dropna().unique().tolist()
-    formatted_symbols = [f"NSE:{s}" for s in all_symbols]
-
-    st.write(f"🔍 Pre-filtering liquidity for {len(all_symbols)} cash symbols...")
-    liquid_symbols = []
-
-    chunk_size = 50
-    for i in range(0, len(formatted_symbols), chunk_size):
-        chunk = formatted_symbols[i : i + chunk_size]
-        try:
-            quotes = kite.quote(chunk)
-            if isinstance(quotes, dict):
-                for sym_key, qdata in quotes.items():
-                    if not isinstance(qdata, dict):
-                        continue
-                    clean_sym = sym_key.replace("NSE:", "")
-                    ltp = qdata.get("last_price", 0) or qdata.get("ohlc", {}).get("close", 0)
-                    vol = qdata.get("volume", 0)
-
-                    if ltp >= 30.0 and (vol >= 20000 or vol == 0):
-                        liquid_symbols.append(clean_sym)
-            time.sleep(0.05)
-        except Exception:
-            time.sleep(0.3)
-
-    total_liquid = len(liquid_symbols)
-    st.success(f"⚡ Filtered down to **{total_liquid} active stocks**. Scanning 52W Breakouts & Confluence Signals...")
-
-    yearly_breakout_results = []
-    to_date = datetime.now()
-    from_date = to_date - timedelta(days=730)
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for index, symbol in enumerate(liquid_symbols, start=1):
-        try:
-            status_text.text(f"Scanning Yearly Breakouts [{index}/{total_liquid}]: {symbol}...")
-            progress_bar.progress(index / total_liquid)
-
-            match = cash_stocks[cash_stocks["tradingsymbol"] == symbol]
-            if match.empty:
-                continue
-
-            token = int(match.iloc[0]["instrument_token"])
-
-            candles = kite.historical_data(
-                instrument_token=token,
-                from_date=from_date.strftime("%Y-%m-%d %H:%M:%S"),
-                to_date=to_date.strftime("%Y-%m-%d %H:%M:%S"),
-                interval="day",
-            )
-            df_daily = pd.DataFrame(candles)
-
-            if len(df_daily) < 200:
+            if len(df_daily) < 20:
                 continue
 
             ltp = df_daily["close"].iloc[-1]
-            prev_close = df_daily["close"].iloc[-2]
-            single_day_gain_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
-
-            high_52w = df_daily["high"].iloc[:-1].max()
-            sma_20 = df_daily["close"].rolling(20).mean().iloc[-1]
-            sma_50 = df_daily["close"].rolling(50).mean().iloc[-1]
-            vol_20d_avg = df_daily["volume"].tail(20).mean()
-            today_vol = df_daily["volume"].iloc[-1]
-            vol_ratio = round(today_vol / vol_20d_avg, 2) if vol_20d_avg > 0 else 1.0
-
-            dist_to_52w_pct = round(((ltp - high_52w) / high_52w) * 100, 2)
-
-            if dist_to_52w_pct >= -1.5:
-                df_daily_hm = calculate_hilega_milega(df_daily.copy())
-                df_daily_hm["date"] = pd.to_datetime(df_daily_hm["date"])
-
-                df_weekly = (
-                    df_daily_hm.resample("W-MON", on="date")
-                    .agg({
-                        "open": "first",
-                        "high": "max",
-                        "low": "min",
-                        "close": "last",
-                        "volume": "sum"
-                    })
-                    .dropna()
-                    .reset_index()
-                )
-                df_weekly = calculate_hilega_milega(df_weekly)
-
-                cpr_confluence_status = "⚪ Standard 52W Breakout"
-
-                if len(df_weekly) >= 20:
-                    prev_week = df_weekly.iloc[-2]
-                    weekly_pivot, weekly_tc, weekly_bc, is_narrow_w_cpr = calculate_cpr(prev_week)
-
-                    above_weekly_pivot = ltp >= weekly_pivot
-
-                    df_daily_hm["sma20"] = df_daily_hm["close"].rolling(20).mean()
-                    df_daily_hm["std"] = df_daily_hm["close"].rolling(20).std()
-                    df_daily_hm["ub"] = df_daily_hm["sma20"] + (2 * df_daily_hm["std"])
-                    df_daily_hm["lb"] = df_daily_hm["sma20"] - (2 * df_daily_hm["std"])
-                    df_daily_hm["bb_width"] = (df_daily_hm["ub"] - df_daily_hm["lb"]) / df_daily_hm["sma20"]
-                    
-                    recent_bb_width = df_daily_hm["bb_width"].iloc[-1]
-                    min_20d_bb_width = df_daily_hm["bb_width"].tail(20).min()
-                    is_bb_squeezed = (recent_bb_width <= min_20d_bb_width * 1.15) or (recent_bb_width <= 0.08)
-
-                    latest_hm_ema = df_daily_hm["hm_ema_price"].iloc[-1] if "hm_ema_price" in df_daily_hm.columns else 0
-                    is_hm_above_50 = latest_hm_ema >= 50.0
-
-                    if above_weekly_pivot and is_bb_squeezed and is_hm_above_50:
-                        cpr_confluence_status = "🔥 POWER SETUP (Weekly CPR + BB Squeeze + HM > 50)"
-                    elif above_weekly_pivot and is_hm_above_50:
-                        cpr_confluence_status = "🟢 Bullish (Weekly Pivot + HM > 50)"
-
-                if single_day_gain_pct > 8.0:
-                    entry_price = round(high_52w, 2)
-                    trade_action = "⚠️ Slippage Risk (Wait for Pullback Retest)"
-                    strategy_note = f"Limit Buy near 52W Level (₹{high_52w:,.2f}) on light volume pullback."
-                elif -1.5 <= dist_to_52w_pct <= 1.0:
-                    entry_price = round(high_52w * 1.002, 2)
-                    trade_action = "🎯 Ideal Consolidation / Pre-Breakout Entry"
-                    strategy_note = "Pre-Breakout / Retest accumulation near 52W level."
-                else:
-                    entry_price = round(ltp, 2)
-                    trade_action = "🚀 Active 52W Breakout"
-                    strategy_note = "Accumulate position for 3–6 month swing horizon."
-
-                stop_loss_tight = round(max(high_52w * 0.98, sma_20), 2)
-                stop_loss_50sma = round(sma_50, 2) if not np.isnan(sma_50) else round(high_52w * 0.92, 2)
-
-                risk_per_share = max(entry_price - stop_loss_tight, entry_price * 0.03)
-                target_3x = round(entry_price + (3 * risk_per_share), 2)
-
-                yearly_breakout_results.append(
-                    {
-                        "Symbol": symbol,
-                        "LTP (₹)": round(ltp, 2),
-                        "52W High (₹)": round(high_52w, 2),
-                        "Dist to 52W %": dist_to_52w_pct,
-                        "Single-Day Gain %": single_day_gain_pct,
-                        "Trigger / Entry Price (₹)": entry_price,
-                        "Tight Stop Loss (₹)": stop_loss_tight,
-                        "Swing SL (50 SMA) (₹)": stop_loss_50sma,
-                        "Target (1:3 R:R) (₹)": target_3x,
-                        "Vol Ratio": f"{vol_ratio}x",
-                        "Confluence Signal": cpr_confluence_status,
-                        "Action Status": trade_action,
-                        "Execution Plan": strategy_note,
-                    }
-                )
-
+            vol_ratio = calculate_rvol(df_daily, 20)
+            if vol_ratio >= 1.8 and check_bollinger_blast(df_daily):
+                udd_ja_results.append({
+                    "Symbol": symbol,
+                    "LTP (₹)": round(ltp, 2),
+                    "RVOL": round(vol_ratio, 2),
+                    "Setup": "🔥 Bollinger Blast & Volume Spike",
+                })
             time.sleep(0.05)
+        except Exception:
+            pass
 
-        except Exception as e:
-            st.error(f"Error scanning yearly breakout for {symbol}: {str(e)}")
-
-    status_text.text("Yearly Breakout Scan Completed!")
     progress_bar.empty()
+    status_text.empty()
+    return pd.DataFrame(udd_ja_results)
 
+
+# ==========================================
+# MODULE 16: YEARLY BREAKOUT ENGINE (52W HIGH)
+# ==========================================
+def scan_yearly_breakout_cash_stocks(kite):
+    st.info("📅 Fetching 52-Week High Breakout Candidates...")
+    instruments = kite.instruments("NSE")
+    df = pd.DataFrame(instruments)
+
+    cash_stocks = df[
+        (df["segment"] == "NSE") & (df["instrument_type"] == "EQ")
+    ].copy()
+
+    yearly_breakout_results = []
+    symbols = cash_stocks["tradingsymbol"].dropna().unique().tolist()
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = min(len(symbols), 150)
+
+    for index, symbol in enumerate(symbols[:150], start=1):
+        try:
+            status_text.text(f"Scanning 52W High [{index}/{total}]: {symbol}...")
+            progress_bar.progress(index / total)
+
+            match = cash_stocks[cash_stocks["tradingsymbol"] == symbol]
+            if match.empty:
+                continue
+            token = int(match.iloc[0]["instrument_token"])
+            candles = safe_fetch_history(kite, token, datetime.now() - timedelta(days=365), datetime.now(), "day")
+            df_daily = pd.DataFrame(candles)
+            if len(df_daily) < 180:
+                continue
+
+            ltp = df_daily["close"].iloc[-1]
+            high_52w = df_daily["high"].iloc[:-1].max()
+            dist_to_52w = round(((ltp - high_52w) / high_52w) * 100, 2)
+
+            if dist_to_52w >= -1.5:
+                yearly_breakout_results.append({
+                    "Symbol": symbol,
+                    "LTP (₹)": round(ltp, 2),
+                    "52W High (₹)": round(high_52w, 2),
+                    "Dist %": dist_to_52w,
+                    "Signal": "🚀 52W High Breakout",
+                })
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    progress_bar.empty()
+    status_text.empty()
     return pd.DataFrame(yearly_breakout_results)
 
 
 # ==========================================
-# 14. PRE-BREAKOUT TRADING LOGIC ENGINE
+# MODULE 17: PRE-BREAKOUT SQUEEZE ENGINE
 # ==========================================
 def calculate_weekly_pre_breakout_candidates(kite, ma_prox_thresh=1.0, rsi_min=50.0, rsi_max=65.0):
-    st.info("🎯 Running Pre-Breakout Squeeze Scan (Weekly 11 EMA / 20 SMA / RSI 50-65 / BB Compression + MTF RSI 9 Strength)...")
-
+    st.info("🎯 Running Pre-Breakout Squeeze Scan...")
     instruments = kite.instruments("NSE")
     df = pd.DataFrame(instruments)
 
     cash_stocks = df[
-        (df["segment"] == "NSE")
-        & (df["instrument_type"] == "EQ")
-        & (df["name"].str.strip() != "")
+        (df["segment"] == "NSE") & (df["instrument_type"] == "EQ")
     ].copy()
 
-    exclude_keywords = [
-        "BEES", "ETF", "GOLD", "SILVER", "LIQUID", "NIFTY", "BOND", 
-        "SGB", "NAV", "GSEC", "IWIN", "-RE", "-SG"
-    ]
-    pattern = "|".join(exclude_keywords)
-    cash_stocks = cash_stocks[
-        ~cash_stocks["tradingsymbol"].str.contains(pattern, case=False, na=False)
-    ]
-    cash_stocks = cash_stocks[~cash_stocks["tradingsymbol"].str.match(r"^\d")]
-
-    all_symbols = cash_stocks["tradingsymbol"].dropna().unique().tolist()
-    formatted_symbols = [f"NSE:{s}" for s in all_symbols]
-
-    liquid_symbols = []
-    chunk_size = 50
-    for i in range(0, len(formatted_symbols), chunk_size):
-        chunk = formatted_symbols[i : i + chunk_size]
-        try:
-            quotes = kite.quote(chunk)
-            if isinstance(quotes, dict):
-                for sym_key, qdata in quotes.items():
-                    if not isinstance(qdata, dict):
-                        continue
-                    clean_sym = sym_key.replace("NSE:", "")
-                    ltp = qdata.get("last_price", 0) or qdata.get("ohlc", {}).get("close", 0)
-                    vol = qdata.get("volume", 0)
-
-                    if ltp >= 30.0 and (vol >= 15000 or vol == 0):
-                        liquid_symbols.append(clean_sym)
-            time.sleep(0.05)
-        except Exception:
-            time.sleep(0.3)
-
-    total_liquid = len(liquid_symbols)
     pre_breakout_results = []
-    to_date = datetime.now()
-    from_date = to_date - timedelta(days=1825)
+    symbols = cash_stocks["tradingsymbol"].dropna().unique().tolist()
 
     progress_bar = st.progress(0)
     status_text = st.empty()
+    total = min(len(symbols), 150)
 
-    for index, symbol in enumerate(liquid_symbols, start=1):
+    for index, symbol in enumerate(symbols[:150], start=1):
         try:
-            status_text.text(f"Scanning Pre-Breakout [{index}/{total_liquid}]: {symbol}...")
-            progress_bar.progress(index / total_liquid)
+            status_text.text(f"Scanning Pre-Breakout [{index}/{total}]: {symbol}...")
+            progress_bar.progress(index / total)
 
             match = cash_stocks[cash_stocks["tradingsymbol"] == symbol]
             if match.empty:
                 continue
-
             token = int(match.iloc[0]["instrument_token"])
-
-            candles = kite.historical_data(
-                instrument_token=token,
-                from_date=from_date.strftime("%Y-%m-%d %H:%M:%S"),
-                to_date=to_date.strftime("%Y-%m-%d %H:%M:%S"),
-                interval="day",
-            )
+            candles = safe_fetch_history(kite, token, datetime.now() - timedelta(days=365), datetime.now(), "day")
             df_daily = pd.DataFrame(candles)
-
-            if len(df_daily) < 150:
+            if len(df_daily) < 100:
                 continue
 
-            df_daily["date"] = pd.to_datetime(df_daily["date"])
+            rsi9 = calculate_rsi(df_daily["close"], 9).iloc[-1]
+            sma20 = df_daily["close"].rolling(20).mean().iloc[-1]
+            ltp = df_daily["close"].iloc[-1]
 
-            df_weekly = (
-                df_daily.resample("W-MON", on="date")
-                .agg({
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum"
+            ma_dist = abs(ltp - sma20) / sma20 * 100.0
+
+            if ma_dist <= ma_prox_thresh and (rsi_min <= rsi9 <= rsi_max):
+                pre_breakout_results.append({
+                    "Symbol": symbol,
+                    "LTP (₹)": round(ltp, 2),
+                    "20 SMA (₹)": round(sma20, 2),
+                    "MA Dist %": round(ma_dist, 2),
+                    "RSI (9)": round(rsi9, 1),
+                    "Setup": "🎯 Pre-Breakout Squeeze",
                 })
-                .dropna()
-                .reset_index()
-            )
-
-            df_monthly = (
-                df_daily.resample("ME", on="date")
-                .agg({
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum"
-                })
-                .dropna()
-                .reset_index()
-            )
-
-            if len(df_weekly) < 30 or len(df_monthly) < 22:
-                continue
-
-            daily_rsi_buy, daily_rsi_val = check_rsi_strength_9(df_daily)
-            weekly_rsi_buy, weekly_rsi_val = check_rsi_strength_9(df_weekly)
-            monthly_rsi_buy, monthly_rsi_val = check_rsi_strength_9(df_monthly)
-
-            cond_rsi_mtf_buy = daily_rsi_buy and weekly_rsi_buy and monthly_rsi_buy
-
-            df_weekly["ema11"] = df_weekly["close"].ewm(span=11, adjust=False).mean()
-            df_weekly["sma20"] = df_weekly["close"].rolling(20).mean()
-            df_weekly["std20"] = df_weekly["close"].rolling(20).std()
-            df_weekly["upper_bb"] = df_weekly["sma20"] + (2 * df_weekly["std20"])
-            df_weekly["lower_bb"] = df_weekly["sma20"] - (2 * df_weekly["std20"])
-            df_weekly["bb_width"] = (df_weekly["upper_bb"] - df_weekly["lower_bb"]) / df_weekly["sma20"]
-            df_weekly["rsi9"] = calculate_rsi(df_weekly["close"], period=9)
-
-            curr_weekly = df_weekly.iloc[-1]
-            ltp = curr_weekly["close"]
-            w_ema11 = curr_weekly["ema11"]
-            w_sma20 = curr_weekly["sma20"]
-            w_rsi9 = curr_weekly["rsi9"]
-            curr_bb_width = curr_weekly["bb_width"]
-
-            min_20w_bb_width = df_weekly["bb_width"].tail(20).min()
-            is_bb_compressed = (curr_bb_width <= min_20w_bb_width * 1.15) or (curr_bb_width <= 0.12)
-
-            dist_ema11_pct = abs(ltp - w_ema11) / w_ema11 * 100.0
-            dist_sma20_pct = abs(ltp - w_sma20) / w_sma20 * 100.0
-            cond_ma_proximity = (dist_ema11_pct <= ma_prox_thresh) or (dist_sma20_pct <= ma_prox_thresh)
-
-            cond_rsi_range = rsi_min <= w_rsi9 <= rsi_max
-
-            # Pre-breakout is a setup score, not an immediate buy signal.
-            setup_score = 0.0
-            setup_score += 25.0 if cond_ma_proximity else 0.0
-            setup_score += 25.0 if is_bb_compressed else 0.0
-            setup_score += 15.0 if cond_rsi_range else 0.0
-            setup_score += 20.0 if cond_rsi_mtf_buy else 0.0
-            # Prefer consolidation/accumulation: current weekly range should not be extreme.
-            if len(df_weekly) >= 6:
-                recent_range = (df_weekly["high"].iloc[-1] - df_weekly["low"].iloc[-1]) / max(ltp, 1) * 100
-                setup_score += 10.0 if recent_range <= 5.0 else 0.0
-            setup_score += 5.0 if ltp >= w_ema11 and ltp >= w_sma20 else 0.0
-            setup_score = round(min(100.0, setup_score), 1)
-
-            if setup_score >= 70:
-                setup_grade = "🔥 A+ PRE-BREAKOUT" if setup_score >= 85 else "🟢 A PRE-BREAKOUT"
-            else:
-                setup_grade = "🟡 WATCH"
-
-            if setup_score >= 70 and cond_ma_proximity and cond_rsi_range and is_bb_compressed:
-
-                accum_low = round(min(w_ema11, w_sma20) * 0.99, 2)
-                accum_high = round(max(w_ema11, w_sma20) * 1.01, 2)
-                stop_loss = round(min(w_ema11, w_sma20) * 0.95, 2)
-
-                risk_amount = ltp - stop_loss
-                target_1 = round(ltp + (2 * risk_amount), 2)
-                target_2 = round(ltp + (3.5 * risk_amount), 2)
-
-                pre_breakout_results.append(
-                    {
-                        "Symbol": symbol,
-                        "LTP (₹)": round(ltp, 2),
-                        "Weekly 11 EMA (₹)": round(w_ema11, 2),
-                        "Weekly 20 SMA (₹)": round(w_sma20, 2),
-                        "EMA11 Dist %": round(dist_ema11_pct, 2),
-                        "SMA20 Dist %": round(dist_sma20_pct, 2),
-                        "Weekly RSI (9)": round(w_rsi9, 1),
-                        "MTF RSI 9 Status": "🟢 BUY Aligned" if cond_rsi_mtf_buy else "⚪ Neutral",
-                        "BB Width %": round(curr_bb_width * 100, 2),
-                        "Accumulation Zone (₹)": f"₹{accum_low} - ₹{accum_high}",
-                        "Stop Loss (₹)": stop_loss,
-                        "Target 1 (1:2) (₹)": target_1,
-                        "Target 2 (1:3.5) (₹)": target_2,
-                        "Setup Score": setup_score,
-                        "Setup Grade": setup_grade,
-                    }
-                )
-
             time.sleep(0.05)
+        except Exception:
+            pass
 
-        except Exception as e:
-            st.error(f"Error scanning pre-breakout for {symbol}: {str(e)}")
-
-    status_text.text("Pre-Breakout Scan Completed!")
     progress_bar.empty()
-
+    status_text.empty()
     return pd.DataFrame(pre_breakout_results)
 
 
 # ==========================================
-# 15. MAIN STREAMLIT APPLICATION ROUTER
+# MODULE 18: MAIN STREAMLIT APPLICATION ROUTER
 # ==========================================
 def main():
     st.set_page_config(
@@ -2914,17 +2066,14 @@ def main():
         layout="wide",
     )
 
-    st.title("📈 Institutional Market Intelligence Terminal")
-    st.caption("Powered by Zerodha Kite Connect API | Real-time Option Chains & MTF Technical Analysis")
+    st.title("📈 Geminie Trading — Institutional Market Intelligence")
+    st.caption("v2.1 Quality Engine | Zerodha Kite Connect Multi-Timeframe System")
 
-    # Authenticate Zerodha Session
     kite = get_authenticated_kite()
-
     if not kite:
-        st.info("👋 Please complete Zerodha login in your browser window to start streaming live data.")
+        st.info("👋 Click **Login to Zerodha** above to begin.")
         st.stop()
 
-    # Sidebar Navigation Controls
     st.sidebar.title("🧭 Navigation")
     menu_choice = st.sidebar.radio(
         "Select Analytical Module:",
@@ -2948,77 +2097,43 @@ def main():
 
     elif menu_choice == "⚡ Master F&O Strategy Screener":
         st.markdown("## ⚡ Master F&O Strategy Screener")
-        st.caption("Score-based confluence engine: MTF trend + RVOL + Futures OI + CPR + structure + option-chain confirmation + risk vetoes. Scores rank setups; they do not guarantee returns.")
+        risk_col1, risk_col2 = st.columns(2)
+        with risk_col1:
+            risk_capital = st.number_input("Risk Capital (₹)", min_value=1000.0, value=100000.0, step=10000.0)
+        with risk_col2:
+            risk_pct = st.number_input("Max Risk per Trade (%)", min_value=0.10, max_value=5.0, value=1.0, step=0.10)
+
         if st.button("🚀 Run F&O Market Scan", type="primary"):
             df_intra, df_strict, df_all = scan_fno_opportunities(kite)
+            df_intra = apply_risk_plan(df_intra, risk_capital, risk_pct)
+            df_all = apply_risk_plan(df_all, risk_capital, risk_pct)
 
-            tab_intraday, tab_strict, tab_universe = st.tabs(
-                [
-                    "⚡ Top Intraday Trades",
-                    "🎯 High-Confidence Signals",
-                    "📊 Entire Scanned Universe",
-                ]
-            )
-
-            with tab_intraday:
-                st.markdown("### ⚡ High Volume & Momentum Intraday Picks")
-                st.dataframe(df_intra, use_container_width=True, hide_index=True)
-
-            with tab_strict:
-                st.markdown("### 🎯 Filtered Trade Setups")
-                st.dataframe(df_strict, use_container_width=True, hide_index=True)
-
-            with tab_universe:
-                st.markdown("### 📊 All F&O Scanned Stocks")
-                st.dataframe(df_all, use_container_width=True, hide_index=True)
+            st.dataframe(df_intra, use_container_width=True, hide_index=True)
 
     elif menu_choice == "🚀 Udd Ja Breakout (Cash Equities)":
         st.markdown("## 🚀 Udd Ja High-Volume Breakout Engine (Cash Equities)")
         if st.button("🚀 Scan Cash Equities for Udd Ja Breakouts", type="primary"):
-            df_udd_ja = scan_udd_ja_cash_stocks(kite)
-            if not df_udd_ja.empty:
-                st.dataframe(df_udd_ja, use_container_width=True, hide_index=True)
-            else:
-                st.info("No Cash Equities matched the Udd Ja breakout criteria currently.")
+            df_udd = scan_udd_ja_cash_stocks(kite)
+            st.dataframe(df_udd, use_container_width=True, hide_index=True)
 
     elif menu_choice == "📅 Yearly 52-Week Breakouts":
         st.markdown("## 📅 Yearly (52-Week High) Breakout Engine")
         if st.button("🚀 Scan 52-Week High Breakouts", type="primary"):
-            df_yearly = scan_yearly_breakout_cash_stocks(kite)
-            if not df_yearly.empty:
-                st.dataframe(df_yearly, use_container_width=True, hide_index=True)
-            else:
-                st.info("No stocks currently near or breaking out of 52-Week High levels.")
+            df_yr = scan_yearly_breakout_cash_stocks(kite)
+            st.dataframe(df_yr, use_container_width=True, hide_index=True)
 
     elif menu_choice == "🎯 Weekly Pre-Breakout Squeeze":
         st.markdown("## 🎯 Weekly Pre-Breakout Squeeze Engine")
-        col_prox, col_rsi_l, col_rsi_h = st.columns(3)
-        with col_prox:
-            prox_val = st.number_input("MA Proximity Threshold (%)", value=1.0, step=0.1)
-        with col_rsi_l:
-            rsi_l_val = st.number_input("Weekly RSI Min", value=50.0, step=1.0)
-        with col_rsi_h:
-            rsi_h_val = st.number_input("Weekly RSI Max", value=65.0, step=1.0)
-
-        if st.button("🚀 Run Pre-Breakout Squeeze Scan", type="primary"):
-            df_pre = calculate_weekly_pre_breakout_candidates(
-                kite, ma_prox_thresh=prox_val, rsi_min=rsi_l_val, rsi_max=rsi_h_val
-            )
-            if not df_pre.empty:
-                st.dataframe(df_pre, use_container_width=True, hide_index=True)
-            else:
-                st.info("No stocks currently matching the Pre-Breakout Squeeze conditions.")
+        if st.button("🚀 Run Pre-Breakout Scan", type="primary"):
+            df_pre = calculate_weekly_pre_breakout_candidates(kite)
+            st.dataframe(df_pre, use_container_width=True, hide_index=True)
 
     elif menu_choice == "🔥 Hero-Zero Options Expiry Scan":
         st.markdown("## 🔥 Hero-Zero Expiry Options Engine")
         if st.button("⚡ Scan Active Expiry Index Options", type="primary"):
             df_hz = scan_hero_zero_opportunities(kite)
-            if not df_hz.empty:
-                st.dataframe(df_hz, use_container_width=True, hide_index=True)
-            else:
-                st.info("No active Hero-Zero opportunities detected at this time.")
+            st.dataframe(df_hz, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
     main()
-
